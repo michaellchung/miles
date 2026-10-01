@@ -148,3 +148,69 @@ class TestUpdateWeightsForwardsMembers:
 
         assert await update_weights(args, actor, executor, controller) == 9
         executor.set_weight_version.assert_awaited_once_with(9, trainer_model_id=None)
+
+
+class TestAFailedOrCancelledMemberUpdateReleasesTheLock:
+    """A27 CPU proof (1): when the trainer's member update fails or is cancelled (yeto cancels it once the
+    target engine is dead), ``placement_group.update_weights`` aborts the update window and the controller lock
+    is free at once, so ``stop_cells``/``describe_cells`` (``@with_lock``) no longer queue behind it."""
+
+    @staticmethod
+    def _args():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            debug_train_only=False, debug_rollout_only=False, start_rollout_id=0, ci_ft_test_actions=None,
+            ci_ft_test_actions_path=None, mini_ft_controller_enable=True, mini_ft_controller_poll_interval=0.01,
+        )
+
+    async def test_an_engine_failure_during_the_update_frees_the_lock_immediately(self):
+        import asyncio
+
+        from miles.ray.placement_group import update_weights
+
+        controller, _, _ = _setup()
+        actor = MagicMock()
+        actor.update_weights = AsyncMock(side_effect=RuntimeError("engine 1 failed to join weight update group"))
+
+        with pytest.raises(RuntimeError, match="failed to join"):
+            await update_weights(
+                self._args(), actor, MagicMock(set_weight_version=AsyncMock()), controller,
+                members=["e0"], expected_epoch=0, admit_cordoned=False,
+            )
+
+        assert not controller.context_lock._lock.locked()
+        await asyncio.wait_for(controller.cordon_cells([]), timeout=1.0)  # a @with_lock call runs at once
+
+    async def test_a_cancelled_hung_update_aborts_the_window_and_frees_the_lock(self):
+        """The hung call (NCCL rendezvous of a dead engine) is cancelled by the caller: CancelledError is a
+        BaseException, so the script's abort_update_weights runs and releases the lock."""
+        import asyncio
+
+        from miles.ray.placement_group import update_weights
+
+        controller, _, _ = _setup()
+        entered = asyncio.Event()
+
+        async def hung(*, info, rollout_id=None):
+            entered.set()
+            await asyncio.Event().wait()
+
+        actor = MagicMock()
+        actor.update_weights = AsyncMock(side_effect=hung)
+        task = asyncio.ensure_future(update_weights(
+            self._args(), actor, MagicMock(set_weight_version=AsyncMock()), controller,
+            members=["e0"], expected_epoch=0, admit_cordoned=False,
+        ))
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        assert controller.context_lock._lock.locked(), "the update window holds the controller lock"
+        waiter = asyncio.ensure_future(controller.cordon_cells([]))  # queued behind the window
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert not controller.context_lock._lock.locked()
+        await asyncio.wait_for(waiter, timeout=1.0)

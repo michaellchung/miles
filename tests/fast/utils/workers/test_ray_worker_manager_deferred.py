@@ -64,6 +64,7 @@ class TestDeclaredButNotStarted:
             pool_id="engine",
             deferred=True,
             state="unbound",
+            lost_workers=None,
             generation=0,
             pg_name=None,
             pg_slot_offset=None,

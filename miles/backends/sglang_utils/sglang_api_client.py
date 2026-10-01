@@ -333,8 +333,10 @@ class SGLangApiClient:
         return await self._make_request("update_weights_from_disk", payload)
 
     async def init_weights_update_group(
-        self, master_address, master_port, rank_offset, world_size, group_name, backend
+        self, master_address, master_port, rank_offset, world_size, group_name, backend, *, timeout: float | None = None
     ):
+        """``timeout`` (seconds) bounds the request; the engine joins the NCCL group inside it, so an engine whose
+        scheduler is dead (HTTP still up) would otherwise never answer (the client reads without a timeout)."""
         return await self._make_request(
             "init_weights_update_group",
             {
@@ -345,6 +347,7 @@ class SGLangApiClient:
                 "group_name": group_name,
                 "backend": backend,
             },
+            timeout=timeout,
         )
 
     async def destroy_weights_update_group(self, group_name):

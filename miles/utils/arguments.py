@@ -1059,6 +1059,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--update-weight-group-timeout-s",
+                type=float,
+                default=None,
+                help=(
+                    "Seconds the 'broadcast' transfer waits for the trainer<->engines NCCL weight-update group "
+                    "(rendezvous and its collectives) and for each engine's init_weights_update_group request. "
+                    "Default (unset): torch's default process-group timeout and an unbounded request. Set it "
+                    "when engines may die mid-publish (elastic membership): a bounded wait lets the caller "
+                    "abort the publish and rebuild instead of stalling."
+                ),
+            )
+            parser.add_argument(
                 "--update-weight-transfer-mode",
                 choices=["broadcast", "p2p", "disk-delta"],
                 default="broadcast",
