@@ -40,6 +40,7 @@ from miles.rollout.session.anthropic_adapter import (
     _validate_anthropic_content_block as _validate_anthropic_content_block,
 )
 from miles.rollout.session.anthropic_adapter import _validate_anthropic_features, anthropic_adapter_available
+from miles.rollout.session import responses_adapter
 from miles.rollout.session.config import SessionServerConfig
 from miles.rollout.session.core import JSON_MEDIA_TYPE, SessionCore, _render_json
 from miles.rollout.session.errors import SessionError
@@ -222,6 +223,12 @@ def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addit
             logger.exception("Anthropic response conversion failed for session %s", session_id)
             return _anthropic_error_response(500, b"")
 
+    # Keep before session_proxy: a Responses call must be recorded, not forwarded raw.
+    @app.post("/sessions/{session_id}/v1/responses")
+    async def responses(request: Request, session_id: str):
+        """Serve the OpenAI Responses API (Codex) through the chat-completions session path."""
+        return await _responses(core, request, session_id)
+
     @app.post("/sessions/{session_id}/samples")
     async def collect_samples(request: Request, session_id: str):
         # Starlette matches routes in registration order; keep this before session_proxy.
@@ -245,3 +252,37 @@ def setup_session_routes(app, backend, config: SessionServerConfig, *, use_addit
             headers=dict(request.headers),
             body=body,
         )
+
+
+async def _responses(core, request: Request, session_id: str) -> Response:
+    """Responses request -> recorded chat completion -> Responses object or event stream."""
+    try:
+        body = json.loads(await request.body() or b"{}")
+        chat_request = responses_adapter.to_chat_request(body)
+    except (ValueError, KeyError, TypeError) as exc:  # json errors are ValueError
+        return JSONResponse(status_code=400, content=responses_adapter.error_body(str(exc)))
+    try:
+        core_response = await core.chat_completions(
+            session_id,
+            method=request.method,
+            query=request.url.query,
+            headers=dict(request.headers),
+            body=_render_json(chat_request),
+        )
+    except SessionError as exc:
+        return JSONResponse(status_code=exc.status_code, content=responses_adapter.error_body(str(exc)))
+    if core_response.status_code != 200:
+        # e.g. 400 context too long, 503 aborted at a cut-off: same status, OpenAI error shape kept by the backend
+        return Response(content=core_response.body, status_code=core_response.status_code,
+                        media_type=JSON_MEDIA_TYPE)
+    try:
+        response = responses_adapter.to_response(json.loads(core_response.body), body)
+    except Exception:
+        # The record is committed; never send a partial stream.
+        logger.exception("Responses conversion failed for session %s", session_id)
+        return JSONResponse(status_code=500, content=responses_adapter.error_body("response conversion failed",
+                                                                                  kind="server_error"))
+    if body.get("stream"):
+        return Response(content=responses_adapter.to_sse(response), status_code=200, media_type="text/event-stream",
+                        headers={"cache-control": "no-cache", "x-accel-buffering": "no"})
+    return JSONResponse(content=response)
