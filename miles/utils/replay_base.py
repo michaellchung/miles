@@ -4,11 +4,31 @@ import os
 import torch
 import torch.distributed as dist
 
+from miles.utils import sync_free
+
 logger = logging.getLogger(__name__)
 
 
 def _get_rank():
     return dist.get_rank() if dist.is_initialized() else 0
+
+
+def _to_current_device(top_indices: torch.Tensor) -> torch.Tensor:
+    # record() keeps each replay buffer in pinned host memory until clear(), so the copy
+    # need not make the host wait for the GPU queue: kernels queued after it on the
+    # current stream see the data, and PyTorch's pinned allocator does not reuse a
+    # buffer before its pending copies finish.  (A pageable buffer, e.g. one set by the
+    # debug replay tools, is staged by the driver; non_blocking stays safe for it.)
+    return top_indices.to(torch.cuda.current_device(), non_blocking=sync_free.enabled())
+
+
+def fill_all_invalid_rows(top_indices: torch.Tensor, all_invalid: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Rows whose picks are all -1 (padding tokens) get picks 0..topk-1 (mod num_experts).
+
+    Other rows are returned unchanged, so applying it when no row is all -1 is a copy.
+    """
+    ar = torch.arange(top_indices.shape[1], device=top_indices.device, dtype=top_indices.dtype) % num_experts
+    return torch.where(all_invalid.unsqueeze(-1), ar, top_indices)
 
 
 class Replay:
@@ -34,12 +54,12 @@ class Replay:
             )
         top_indices = self.top_indices_list[self.forward_index]
         self.forward_index += 1
-        return top_indices.to(torch.cuda.current_device())
+        return _to_current_device(top_indices)
 
     def pop_backward(self) -> torch.Tensor:
         top_indices = self.top_indices_list[self.backward_index]
         self.backward_index += 1
-        return top_indices.to(torch.cuda.current_device())
+        return _to_current_device(top_indices)
 
     def clear(self):
         self.forward_index = 0
@@ -99,14 +119,12 @@ class BaseReplayManager:
             if self.enable_check_replay_result:
                 self.check_replay_result(old_topk_fn, scores, topk, top_indices, *args, **kwargs)
 
-            # fill padding tokens with arange to avoid invalid reading
+            # fill padding tokens with arange to avoid invalid reading; the sync-free path
+            # fills unconditionally (a no-op for rows with a valid pick) instead of reading
+            # all_invalid.any() on the host
             all_invalid = (top_indices == -1).all(dim=-1)
-            if all_invalid.any():
-                ar = (
-                    torch.arange(top_indices.shape[1], device=top_indices.device, dtype=top_indices.dtype)
-                    % scores.shape[1]
-                )
-                top_indices = torch.where(all_invalid.unsqueeze(-1), ar, top_indices)
+            if sync_free.enabled() or all_invalid.any():
+                top_indices = fill_all_invalid_rows(top_indices, all_invalid, scores.shape[1])
 
             if return_probs:
                 return scores.gather(1, top_indices), top_indices
