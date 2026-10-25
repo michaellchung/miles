@@ -7,7 +7,9 @@ Importing this module (once per process; later imports are no-ops):
 * imports ``miles_plugins.megatron_bridge``, which registers miles' bridge
   subclasses and shims with ``megatron.bridge`` before any ``AutoBridge`` use;
 * keeps the CPU FP32 masters of Megatron's HybridDeviceOptimizer in pinned
-  memory (``hybrid_optimizer_pinning``).
+  memory (``hybrid_optimizer_pinning``);
+* replaces the DeepEP dispatcher's ``_indices_to_multihot`` with a version that
+  does not make the host wait for the GPU (``moe_multihot_sync_free``).
 
 These used to run in the package ``__init__``, so every process that touched
 a light submodule (``megatron_config``, ``checkpoint_tracker``) paid for
@@ -21,7 +23,7 @@ import logging
 
 import torch
 
-from miles.backends.megatron_utils import hybrid_optimizer_pinning
+from miles.backends.megatron_utils import hybrid_optimizer_pinning, moe_multihot_sync_free
 
 try:
     import deep_ep
@@ -49,3 +51,7 @@ except Exception as _e:  # best-effort; not every environment uses megatron.brid
 # HybridDeviceOptimizer (--optimizer-cpu-offload) keeps its CPU FP32 masters in
 # pinned memory, so their per-step copy back to the GPU is a DMA copy.
 hybrid_optimizer_pinning.install()
+
+# DeepEP dispatch postprocessing without host syncs (a few per MoE layer and micro
+# batch upstream); checks the Megatron source first and keeps it when unknown.
+moe_multihot_sync_free.install()
