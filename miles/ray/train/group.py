@@ -496,6 +496,14 @@ class TrainerController:
         """Install one exact-coverage fragment plan on every owner rank."""
         return await full_parameter_transport.install_fragment_plans(self, plans)
 
+    async def full_parameter_partition_reports(self) -> tuple:
+        """Every rank's parameters with their tensor-parallel partitions (shape-free layout)."""
+        return await full_parameter_transport.partition_reports(self)
+
+    async def install_full_parameter_owner_maps(self, owner_maps: dict) -> int:
+        """Install every rank's parameter owners before its plan (shape-free layout)."""
+        return await full_parameter_transport.install_owner_maps(self, owner_maps)
+
     async def export_full_parameter_chunked_cut(
         self,
         policy_version: int,

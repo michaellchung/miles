@@ -17,6 +17,8 @@ from miles.backends.megatron_utils import full_parameter_state as state
 # Operations that take the actor's role.
 _ROLE_OPERATIONS = {
     "full_parameter_shard_manifest": state.full_parameter_shard_manifest,
+    "full_parameter_partition_report": state.full_parameter_partition_report,
+    "install_full_parameter_owner_map": state.install_full_parameter_owner_map,
     "install_full_parameter_fragment_plan": state.install_full_parameter_fragment_plan,
     "export_full_parameter_chunked_shard": state.export_full_parameter_chunked_shard,
     "note_full_parameter_replica_export": state.note_full_parameter_replica_export,

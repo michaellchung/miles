@@ -18,6 +18,7 @@ from miles.backends.megatron_utils.full_parameter_state import (
     FullParameterLocalStepReceipt,
     FullParameterOptimizerState,
     FullParameterOwnerFragmentPlan,
+    FullParameterPartitionReport,
     FullParameterShardManifest,
     FullParameterTopology,
     _chunk_hash,
@@ -58,6 +59,10 @@ _CUT_CONTENT_IDENTITY_DOMAIN = b"miles-full-parameter-chunked-cut-content-v1\0"
 #       optimizer, which keeps one FP32 range of each parameter per rank; the
 #       other ranks contribute their ranges to an owner's export
 #       (``full_parameter_sharded_masters``)
+#   shape_free_layout: partition reports, installed owner maps and free-order
+#       plans, so a yeto shape-free layout addresses every parameter by
+#       global slices and islands of different TP/EP/DP shapes share one
+#       syncer session
 FULL_PARAMETER_TRANSPORT_FEATURES = frozenset(
     {
         "skip_resident",
@@ -73,6 +78,7 @@ FULL_PARAMETER_TRANSPORT_FEATURES = frozenset(
         # An apply may name fragments whose stored chunks the caller already
         # verified (``verify_stored_fragment_chunks``); their prepare reads none.
         "verified_apply",
+        "shape_free_layout",
     }
 )
 
@@ -660,6 +666,39 @@ async def shard_manifests(group) -> tuple[FullParameterShardManifest, ...]:
     )
     replica_owner_manifests(manifests)
     return manifests
+
+
+async def partition_reports(group) -> tuple[FullParameterPartitionReport, ...]:
+    """Every rank's parameters with their tensor-parallel partitions (a shape-free layout)."""
+
+    return tuple(
+        await _rank_values(
+            group,
+            "full_parameter_partition_report",
+            FullParameterPartitionReport,
+            "Megatron returned incomplete full-parameter partition reports",
+        )
+    )
+
+
+async def install_owner_maps(
+    group,
+    owner_maps: Mapping[FullParameterTopology, Mapping[str, tuple[int, tuple[int, ...]]]],
+) -> int:
+    """Install every rank's owner map (``install_full_parameter_owner_map``) before its plan."""
+
+    topologies = await _group_topologies(group)
+    if set(topologies) != set(owner_maps):
+        raise RuntimeError("full-parameter owner maps do not match the actor group")
+    results = await _rank_call(
+        group,
+        "install_full_parameter_owner_map",
+        by_topology={topology: {"owner_map": dict(owner_maps[topology])} for topology in topologies},
+    )
+    failure = next((result for result in results if isinstance(result, BaseException)), None)
+    if failure is not None or any(isinstance(result, bool) or not isinstance(result, int) for result in results):
+        raise RuntimeError("Megatron ranks rejected full-parameter owner maps") from failure
+    return sum(results)
 
 
 def replica_owner_manifests(

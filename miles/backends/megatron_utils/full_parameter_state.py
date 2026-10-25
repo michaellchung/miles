@@ -262,6 +262,82 @@ class FullParameterHolding:
             raise ValueError(f"full-parameter owner of {self.name!r} is not one of its replicas")
 
 
+@dataclass(frozen=True, order=True)
+class FullParameterPartition:
+    """How one local trainable parameter relates to its global tensor.
+
+    ``partition_dim`` is None for a parameter tensor parallelism does not
+    split (an expert: expert tensor parallelism is 1; a norm or a router:
+    every tensor-parallel rank holds the same copy).  Otherwise the local
+    tensor is this rank's part of the global tensor along ``partition_dim``;
+    ``partition_sizes`` lists the local sizes of the blocks the dimension
+    packs (Megatron ``partition_sizes``, e.g. Mamba ``in_proj`` z/x/B/C/dt),
+    one block when Megatron sets none.  A yeto shape-free layout reads this to
+    address every parameter by global slices (yeto ``shape_free_layout``)."""
+
+    name: str
+    shape: tuple[int, ...]
+    expert: bool
+    partition_dim: int | None = None
+    partition_sizes: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not _PARAMETER_NAME.fullmatch(self.name) or "::" in self.name:
+            raise ValueError(f"invalid full-parameter name: {self.name!r}")
+        if not isinstance(self.shape, tuple) or not self.shape or any(
+            isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0 for dimension in self.shape
+        ):
+            raise ValueError(f"invalid shape for full-parameter partition {self.name!r}")
+        if self.partition_dim is None:
+            if self.partition_sizes:
+                raise ValueError(f"{self.name!r} has partition sizes but no partition dimension")
+            return
+        if isinstance(self.partition_dim, bool) or not isinstance(self.partition_dim, int) or not 0 <= self.partition_dim < len(self.shape):
+            raise ValueError(f"invalid partition dimension of {self.name!r}")
+        if (
+            not self.partition_sizes
+            or any(isinstance(size, bool) or not isinstance(size, int) or size <= 0 for size in self.partition_sizes)
+            or sum(self.partition_sizes) != self.shape[self.partition_dim]
+        ):
+            raise ValueError(f"partition sizes of {self.name!r} do not add up to its local dimension")
+
+
+@dataclass(frozen=True)
+class FullParameterPartitionReport:
+    """One rank's parameters with their tensor-parallel partitions and replica groups.
+
+    ``dense_ranks`` / ``expert_ranks``: the data-parallel groups
+    (``FullParameterReplication``); ``tensor_parallel_ranks``: the
+    tensor-parallel group in group order (rank ``topology.tp_rank`` is this
+    rank).  ``expert_tensor_parallel_size`` must be 1 for a shape-free
+    layout."""
+
+    topology: FullParameterTopology
+    role: str
+    global_rank: int
+    dense_ranks: tuple[int, ...]
+    expert_ranks: tuple[int, ...] | None
+    tensor_parallel_ranks: tuple[int, ...]
+    expert_tensor_parallel_size: int
+    parameters: tuple[FullParameterPartition, ...]
+
+    def __post_init__(self) -> None:
+        if not _ROLE.fullmatch(self.role):
+            raise ValueError(f"invalid full-parameter role: {self.role!r}")
+        _validate_non_negative_integer(self.global_rank, "global rank")
+        for name in ("dense_ranks", "tensor_parallel_ranks"):
+            if self.global_rank not in _validate_rank_tuple(getattr(self, name), name.replace("_", " ")):
+                raise ValueError(f"full-parameter {name.replace('_', ' ')} do not contain this rank")
+        if self.expert_ranks is not None and self.global_rank not in _validate_rank_tuple(self.expert_ranks, "expert ranks"):
+            raise ValueError("full-parameter expert ranks do not contain this rank")
+        if len(self.tensor_parallel_ranks) != self.topology.tp_size or self.tensor_parallel_ranks[self.topology.tp_rank] != self.global_rank:
+            raise ValueError("full-parameter tensor-parallel ranks disagree with the topology")
+        if isinstance(self.expert_tensor_parallel_size, bool) or not isinstance(self.expert_tensor_parallel_size, int) or self.expert_tensor_parallel_size < 1:
+            raise ValueError("full-parameter expert tensor-parallel size is malformed")
+        if not self.parameters or self.parameters != tuple(sorted(self.parameters)) or len({item.name for item in self.parameters}) != len(self.parameters):
+            raise ValueError("full-parameter partition report is not canonical")
+
+
 @dataclass(frozen=True)
 class FullParameterShardManifest:
     """Small immutable description of one topology-owned FP32 master shard.
@@ -335,7 +411,13 @@ class FullParameterFragmentPlan:
     def __post_init__(self) -> None:
         if isinstance(self.fragment_id, bool) or not isinstance(self.fragment_id, int) or self.fragment_id < 0:
             raise ValueError("full-parameter fragment ID must be non-negative")
-        if not self.wire_names or len(set(self.wire_names)) != len(self.wire_names) or any(not isinstance(name, str) or name.count("::") != 2 or not name for name in self.wire_names):
+        # A wire name repeats inside one fragment only with flat ranges: a
+        # shape-free plan reads one parameter as several flat segments.
+        if (
+            not self.wire_names
+            or (not self.flat_ranges and len(set(self.wire_names)) != len(self.wire_names))
+            or any(not isinstance(name, str) or name.count("::") != 2 or not name for name in self.wire_names)
+        ):
             raise ValueError("full-parameter fragment wire names are malformed")
         if isinstance(self.numel, bool) or not isinstance(self.numel, int) or self.numel < 1:
             raise ValueError("full-parameter fragment must contain scalars")
@@ -374,6 +456,13 @@ class FullParameterOwnerFragmentPlan:
     topology: FullParameterTopology
     parameter_layout_hash: str
     fragments: tuple[FullParameterFragmentPlan, ...]
+    # ``False``: the members follow this rank's canonical spec order and tile
+    # each parameter in order (every plan before shape-free layouts).  ``True``
+    # (a shape-free layout, yeto ``shape_free_layout``): the members follow the
+    # global layout's order, so one parameter may be read as several flat
+    # segments in any order; the manifest check still proves they cover every
+    # owned parameter exactly once.
+    free_member_order: bool = False
 
     def __post_init__(self) -> None:
         if not _SHA256.fullmatch(self.parameter_layout_hash):
@@ -383,6 +472,10 @@ class FullParameterOwnerFragmentPlan:
         fragment_ids = [fragment.fragment_id for fragment in self.fragments]
         if len(set(fragment_ids)) != len(fragment_ids):
             raise ValueError("full-parameter owner plan has duplicate fragment IDs")
+        if not isinstance(self.free_member_order, bool):
+            raise ValueError("full-parameter owner plan member order flag is malformed")
+        if self.free_member_order:
+            return
         # A split parameter repeats its wire name only across consecutive
         # members; the manifest check proves the ranges tile the parameter.
         names = [name for fragment in self.fragments for name in fragment.wire_names]
@@ -398,6 +491,8 @@ class FullParameterOwnerFragmentPlan:
             "parameter_layout_hash": self.parameter_layout_hash,
             "fragments": [fragment.identity() for fragment in self.fragments],
         }
+        if self.free_member_order:  # canonical-order plans keep their hash
+            payload["free_member_order"] = True
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -749,6 +844,40 @@ def _replica_owners(
     return owners
 
 
+_OWNER_MAP_ATTRIBUTE = "_external_full_parameter_owner_map"
+
+
+def _installed_owners(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    replication: FullParameterReplication,
+    owner_map: Mapping[str, tuple[int, tuple[int, ...]]],
+) -> dict[str, tuple[int, tuple[int, ...]]]:
+    """``{name: (owner rank, writer ranks)}`` from an installed owner map (a shape-free layout).
+
+    The writers are every rank that holds an identical copy of the parameter:
+    its data-parallel group (the ranks whose FP32 master ranges tile it,
+    ``FullParameterReplication.ranks_for``) and, for a parameter tensor
+    parallelism does not split, the data-parallel groups of the other
+    tensor-parallel ranks.  The owner exports the parameter; every other
+    writer holds a replica and writes the owner's bytes."""
+
+    names = {name for name, _parameter in named_parameters}
+    if set(owner_map) != names:
+        raise RuntimeError("full-parameter owner map does not name exactly this rank's parameters")
+    owners: dict[str, tuple[int, tuple[int, ...]]] = {}
+    for name, parameter in named_parameters:
+        owner, writers = owner_map[name]
+        writers = _validate_rank_tuple(tuple(writers), "writer ranks")
+        if (
+            owner not in writers
+            or replication.global_rank not in writers
+            or not set(replication.ranks_for(name, parameter)) <= set(writers)
+        ):
+            raise RuntimeError(f"full-parameter owner map entry of {name!r} disagrees with its replica group")
+        owners[name] = (owner, writers)
+    return owners
+
+
 @dataclass(frozen=True)
 class _LocalLayout:
     """This rank's parameters split into the ones it owns and the replicas it holds.
@@ -775,12 +904,16 @@ def _local_layout(
     topology: FullParameterTopology,
     replication: FullParameterReplication,
     optimizer_owned_parameter_ids: frozenset[int] | None = None,
+    owner_map: Mapping[str, tuple[int, tuple[int, ...]]] | None = None,
 ) -> _LocalLayout:
+    """``owner_map`` (a shape-free layout, ``install_full_parameter_owner_map``)
+    replaces the balanced owners of ``_replica_owners``."""
+
     ordered = tuple(sorted(named_parameters, key=lambda value: value[0]))
     for name, parameter in ordered:
         if not isinstance(parameter, torch.nn.Parameter):
             raise TypeError(f"{name!r} is not a trainable parameter")
-    owners = _replica_owners(ordered, replication)
+    owners = _replica_owners(ordered, replication) if owner_map is None else _installed_owners(ordered, replication, owner_map)
     ranges = sharded.master_ranges(ordered, replication, optimizer_owned_parameter_ids)
     specs, masters, holdings, replica_masters = [], {}, [], {}
     for name, parameter in ordered:
@@ -820,6 +953,7 @@ def _actor_local_layout(actor, *, role: str, topology: FullParameterTopology) ->
         topology=topology,
         replication=full_parameter_replication(),
         optimizer_owned_parameter_ids=optimizer_owned,
+        owner_map=getattr(actor, _OWNER_MAP_ATTRIBUTE, None),
     )
     return named_parameters, optimizer_owned, layout
 
@@ -1547,10 +1681,107 @@ def full_parameter_shard_manifest(
         topology=topology,
         replication=replication,
         optimizer_owned_parameter_ids=optimizer_owned,
+        owner_map=getattr(actor, _OWNER_MAP_ATTRIBUTE, None),
     )
     if layout.ranges is not None:
         sharded.refuse_unsupported_args(actor.args)
     return _manifest_from_layout(layout, topology=topology, role=role, global_rank=replication.global_rank)
+
+
+def _tensor_parallel_ranks() -> tuple[tuple[int, ...], int]:
+    """``(tensor-parallel group ranks, expert tensor-parallel size)``; one rank when not distributed."""
+
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return (0,), 1
+    from megatron.core import mpu
+
+    ranks = tuple(int(rank) for rank in dist.get_process_group_ranks(mpu.get_tensor_model_parallel_group()))
+    try:
+        expert_tp = int(mpu.get_expert_tensor_parallel_world_size())
+    except (AssertionError, RuntimeError, AttributeError):  # no expert groups
+        expert_tp = 1
+    return ranks, expert_tp
+
+
+def _parameter_partition(name: str, parameter: torch.nn.Parameter, *, gated: bool = False) -> FullParameterPartition:
+    """Megatron's tensor-parallel attributes of one parameter (``tensor_model_parallel``,
+    ``partition_dim``, ``partition_stride``, ``partition_sizes``).
+
+    ``gated`` (``--swiglu``): a dense ``linear_fc1`` packs the gate and the up
+    projection, each split by tensor parallelism (Megatron's swiglu sharded
+    factory), so its local rows are two blocks."""
+
+    shape = tuple(int(dimension) for dimension in parameter.shape)
+    expert = not bool(getattr(parameter, "allreduce", True))
+    if expert or not bool(getattr(parameter, "tensor_model_parallel", False)):
+        return FullParameterPartition(name=name, shape=shape, expert=expert)
+    if int(getattr(parameter, "partition_stride", 1)) != 1:
+        raise RuntimeError(f"{name!r} has a strided tensor-parallel partition; a shape-free layout needs stride 1")
+    dim = int(getattr(parameter, "partition_dim", 0))
+    sizes = getattr(parameter, "partition_sizes", None)
+    if sizes is None and gated and dim == 0 and name.endswith("linear_fc1.weight") and shape[0] % 2 == 0:
+        sizes = (shape[0] // 2, shape[0] // 2)
+    sizes = (shape[dim],) if sizes is None else tuple(int(size) for size in sizes)
+    return FullParameterPartition(name=name, shape=shape, expert=False, partition_dim=dim, partition_sizes=sizes)
+
+
+def full_parameter_partition_report(
+    actor,
+    *,
+    role: str = "actor",
+) -> FullParameterPartitionReport:
+    """Every local trainable parameter with its tensor-parallel partition and this
+    rank's replica groups, without parameter payloads (a shape-free layout plans from it)."""
+
+    require_full_parameter_actor(actor.args, "describe")
+    topology = full_parameter_topology()
+    replication = full_parameter_replication()
+    tp_ranks, expert_tp = _tensor_parallel_ranks()
+    named_parameters, _optimizer_owned = _actor_parameter_context(actor)
+    return FullParameterPartitionReport(
+        topology=topology,
+        role=role,
+        global_rank=replication.global_rank,
+        dense_ranks=replication.dense_ranks,
+        expert_ranks=replication.expert_ranks,
+        tensor_parallel_ranks=tp_ranks,
+        expert_tensor_parallel_size=expert_tp,
+        parameters=tuple(
+            sorted(
+                _parameter_partition(name, parameter, gated=bool(getattr(actor.args, "swiglu", False)))
+                for name, parameter in named_parameters
+            )
+        ),
+    )
+
+
+def install_full_parameter_owner_map(
+    actor,
+    owner_map: Mapping[str, tuple[int, tuple[int, ...]]],
+    *,
+    role: str = "actor",
+) -> int:
+    """Install the owner and writer ranks of every local parameter (a shape-free layout).
+
+    Install it before the fragment plan; the manifests then list the owned
+    parameters it names (``_installed_owners``).  Installing the same map again
+    is a no-op; another map is refused once a plan is installed."""
+
+    require_full_parameter_actor(actor.args, "describe")
+    if getattr(actor, "_external_full_parameter_prepared_cut", None) is not None:
+        raise RuntimeError("cannot change full-parameter owners with a prepared cut")
+    normalized = {
+        str(name): (int(owner), tuple(int(rank) for rank in writers)) for name, (owner, writers) in owner_map.items()
+    }
+    named_parameters, _optimizer_owned = _actor_parameter_context(actor)
+    _installed_owners(tuple(sorted(named_parameters, key=lambda value: value[0])), full_parameter_replication(), normalized)
+    installed = getattr(actor, _OWNER_MAP_ATTRIBUTE, None)
+    if installed is not None and installed != normalized and getattr(actor, "_external_full_parameter_fragment_plan", None) is not None:
+        raise RuntimeError("full-parameter owners cannot change after the fragment plan is installed")
+    setattr(actor, _OWNER_MAP_ATTRIBUTE, normalized)
+    return len(normalized)
 
 
 def _manifest_from_layout(
@@ -1581,6 +1812,9 @@ def _validate_fragment_plan_against_manifest(
         raise RuntimeError("full-parameter owner plan topology changed")
     canonical_names = tuple(spec.wire_name for spec in manifest.specs)
     numel_by_name = {spec.wire_name: spec.numel for spec in manifest.specs}
+    if plan.free_member_order:
+        _validate_free_order_cover(plan, numel_by_name)
+        return
     planned_names: list[str] = []
     cursor = {}
     for fragment in plan.fragments:
@@ -1604,6 +1838,33 @@ def _validate_fragment_plan_against_manifest(
         raise RuntimeError("full-parameter owner plan does not preserve canonical spec order")
 
 
+def _validate_free_order_cover(plan: FullParameterOwnerFragmentPlan, numel_by_name: Mapping[str, int]) -> None:
+    """A free-order plan's members cover every owned parameter exactly once."""
+
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    for fragment in plan.fragments:
+        unknown = [name for name in fragment.wire_names if name not in numel_by_name]
+        if unknown:
+            raise RuntimeError(f"full-parameter owner plan contains unknown parameter {unknown[0]!r}")
+        members = fragment.members(numel_by_name)
+        if sum(stop - start for _name, start, stop in members) != fragment.numel:
+            raise RuntimeError("full-parameter fragment scalar count changed")
+        for name, start, stop in members:
+            if not 0 <= start < stop <= numel_by_name[name]:
+                raise RuntimeError("full-parameter fragment range is outside its parameter")
+            ranges.setdefault(name, []).append((start, stop))
+    if set(ranges) != set(numel_by_name):
+        raise RuntimeError("full-parameter owner plan does not exactly cover the local shard")
+    for name, spans in ranges.items():
+        cursor = 0
+        for start, stop in sorted(spans):
+            if start != cursor:
+                raise RuntimeError(f"full-parameter fragment ranges of {name!r} overlap or leave a gap")
+            cursor = stop
+        if cursor != numel_by_name[name]:
+            raise RuntimeError("full-parameter owner plan does not exactly cover the local shard")
+
+
 def install_full_parameter_fragment_plan(
     actor,
     plan: FullParameterOwnerFragmentPlan,
@@ -1622,7 +1883,12 @@ def install_full_parameter_fragment_plan(
         raise RuntimeError("cannot change a full-parameter plan with a prepared cut")
     manifest = full_parameter_shard_manifest(actor, role=role)
     _validate_fragment_plan_against_manifest(plan, manifest)
-    replica_plan = replicas.build_replica_plan(manifest, plan, tuple(replica_sources))
+    master_ranks = None
+    if getattr(actor, _OWNER_MAP_ATTRIBUTE, None) is not None:
+        replication = full_parameter_replication()
+        named_parameters, _optimizer_owned = _actor_parameter_context(actor)
+        master_ranks = {name: replication.ranks_for(name, parameter) for name, parameter in named_parameters}
+    replica_plan = replicas.build_replica_plan(manifest, plan, tuple(replica_sources), master_ranks=master_ranks)
     installed = getattr(actor, "_external_full_parameter_fragment_plan", None)
     if installed is not None and installed != plan:
         raise RuntimeError("full-parameter owner plan is already installed")
@@ -1652,6 +1918,7 @@ def _require_installed_layout(actor, *, role: str):
         topology=topology,
         replication=replication,
         optimizer_owned_parameter_ids=optimizer_owned,
+        owner_map=getattr(actor, _OWNER_MAP_ATTRIBUTE, None),
     )
     manifest = _manifest_from_layout(layout, topology=topology, role=role, global_rank=replication.global_rank)
     _validate_fragment_plan_against_manifest(plan, manifest)

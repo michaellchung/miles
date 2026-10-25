@@ -331,6 +331,8 @@ def _local_pieces(fragment, ranges: Mapping[str, MasterRange]) -> list[tuple[int
 
     pieces = []
     for copy in fragment.copies:
+        if not getattr(copy, "contributes", True):
+            continue  # another tensor-parallel rank's group holds the owner's master ranges
         inside = ranges[copy.name].overlap(copy.start, copy.stop)
         if inside is not None:
             low, high = inside
