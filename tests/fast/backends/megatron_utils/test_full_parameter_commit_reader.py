@@ -1,7 +1,8 @@
 """The commit reads its chunks ahead of the copy and casts the model on the master's device.
 
-* ``CommitChunkReader``: worker threads ``ray.get`` the commit's chunks in copy
-  order and read one byte of each page the copy uses, a bounded window ahead.
+* ``CommitChunkReader``: the hashing pool's threads ``ray.get`` the commit's
+  chunks in copy order and read one byte of each page the copy uses, a
+  bounded window ahead.
   Every chunk is read once; an error surfaces where the copy reads the chunk.
 * ``MasterRange.write``: the values inside a rank's range cross to the master
   once and the model takes the master's cast (Megatron's main-to-model copy);
@@ -15,6 +16,7 @@ ties, subnormals, signed zeros and the top of the BF16 range.
 from __future__ import annotations
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -22,7 +24,7 @@ import torch
 
 from miles.backends.megatron_utils import full_parameter_chunk_reader as reader_module
 from miles.backends.megatron_utils import full_parameter_sharded_masters as sharded
-from miles.backends.megatron_utils.full_parameter_chunk_reader import CommitChunkReader, prefetch_threads, touch_pages
+from miles.backends.megatron_utils.full_parameter_chunk_reader import CommitChunkReader, prefetch_enabled, touch_pages
 from miles.ray.full_parameter_transport import apply_chunked_cut, export_chunked_cut
 from tests.fast.backends.megatron_utils.test_full_parameter_dp_sharded_masters import (  # noqa: F401 - fixture
     _CHUNK_BYTES,
@@ -126,7 +128,7 @@ def _values(count, numel=3000):
 def test_reader_returns_every_chunk_once_in_copy_order():
     ray = _Ray(_values(9))
     reads = [(reference, None if index % 2 else ((5, 2000),)) for index, reference in enumerate(ray.order)]
-    reader = CommitChunkReader(reads, ray_module=ray, threads=3, window=4)
+    reader = CommitChunkReader(reads, ray_module=ray, pool=ThreadPoolExecutor(3), window=4)
     try:
         for reference in ray.order:
             assert reader.get(reference) is ray.objects[reference]
@@ -134,14 +136,14 @@ def test_reader_returns_every_chunk_once_in_copy_order():
         reader.close()
     assert ray.gets == {reference: 1 for reference in ray.order}
     stats = reader.stats()
-    assert stats["prefetch_threads"] == 3 and stats["prefetched_chunks"] == 9
+    assert stats["prefetch"] and stats["prefetched_chunks"] == 9
     assert stats["fetch_wait_seconds"] >= 0 and stats["prefetch_read_seconds"] >= 0
 
 
 def test_reader_window_bounds_reads_ahead():
     gate = threading.Event()
     ray = _Ray(_values(12), gate=gate)
-    reader = CommitChunkReader([(reference, None) for reference in ray.order], ray_module=ray, threads=8, window=3)
+    reader = CommitChunkReader([(reference, None) for reference in ray.order], ray_module=ray, pool=ThreadPoolExecutor(8), window=3)
     try:
         assert len(reader._inflight) == 3 and len(reader._pending) == 9
         gate.set()
@@ -154,7 +156,7 @@ def test_reader_window_bounds_reads_ahead():
 
 def test_reader_falls_back_for_a_chunk_out_of_order():
     ray = _Ray(_values(6))
-    reader = CommitChunkReader([(reference, None) for reference in ray.order], ray_module=ray, threads=2, window=2)
+    reader = CommitChunkReader([(reference, None) for reference in ray.order], ray_module=ray, pool=ThreadPoolExecutor(2), window=2)
     try:
         last = ray.order[-1]  # not read ahead yet: read here and never again
         assert reader.get(last) is ray.objects[last]
@@ -169,7 +171,7 @@ def test_reader_falls_back_for_a_chunk_out_of_order():
 def test_reader_error_surfaces_at_the_failing_chunk():
     ray = _Ray(_values(5))
     ray.fail = ray.order[2]
-    reader = CommitChunkReader([(reference, None) for reference in ray.order], ray_module=ray, threads=2)
+    reader = CommitChunkReader([(reference, None) for reference in ray.order], ray_module=ray, pool=ThreadPoolExecutor(2))
     try:
         reader.get(ray.order[0])
         reader.get(ray.order[1])
@@ -182,31 +184,28 @@ def test_reader_error_surfaces_at_the_failing_chunk():
 
 def test_reader_off_reads_in_the_calling_thread():
     ray = _Ray(_values(3))
-    reader = CommitChunkReader([(reference, None) for reference in ray.order], ray_module=ray, threads=0)
+    reader = CommitChunkReader([(reference, None) for reference in ray.order], ray_module=ray, pool=None)
     assert reader._pool is None and not reader._pending
     for reference in ray.order:
         assert reader.get(reference) is ray.objects[reference]
     reader.close()
-    assert reader.stats()["prefetch_threads"] == 0 and reader.stats()["prefetched_chunks"] == 0
+    assert not reader.stats()["prefetch"] and reader.stats()["prefetched_chunks"] == 0
 
 
-def test_prefetch_threads_default_env_and_stand_ins(monkeypatch):
+def test_prefetch_default_env_and_stand_ins(monkeypatch):
     real = type("RayModule", (), {"__name__": "ray"})()
-    monkeypatch.delenv(reader_module.PREFETCH_THREADS_ENV, raising=False)
-    assert prefetch_threads(real) == 2
-    assert prefetch_threads(object()) == 0  # an in-process stand-in maps nothing lazily
-    monkeypatch.setenv(reader_module.PREFETCH_THREADS_ENV, "0")
-    assert prefetch_threads(real) == 0
-    monkeypatch.setenv(reader_module.PREFETCH_THREADS_ENV, "4")
+    monkeypatch.delenv(reader_module.PREFETCH_ENV, raising=False)
+    monkeypatch.delenv(reader_module._ZERO_COPY_ENV, raising=False)
+    assert prefetch_enabled(real)
+    assert not prefetch_enabled(object())  # an in-process stand-in maps nothing lazily
     monkeypatch.setenv(reader_module._ZERO_COPY_ENV, "0")  # a get copies: no read-ahead
-    assert prefetch_threads(real) == 0
+    assert not prefetch_enabled(real)
     monkeypatch.delenv(reader_module._ZERO_COPY_ENV)
-    monkeypatch.setenv(reader_module.PREFETCH_THREADS_ENV, "65")
-    with pytest.raises(RuntimeError, match="0..64"):
-        prefetch_threads(real)
-    monkeypatch.setenv(reader_module.PREFETCH_THREADS_ENV, "two")
-    with pytest.raises(RuntimeError, match="integer"):
-        prefetch_threads(real)
+    monkeypatch.setenv(reader_module.PREFETCH_ENV, "0")
+    assert not prefetch_enabled(real)
+    monkeypatch.setenv(reader_module.PREFETCH_ENV, "2")
+    with pytest.raises(RuntimeError, match="0 or 1"):
+        prefetch_enabled(real)
 
 
 def test_touch_pages_reads_without_changing_anything():
@@ -244,9 +243,9 @@ def _snapshot(pair):
 @pytest.mark.parametrize(("world", "ep"), [(2, 2), (4, 2), (4, 1)])
 async def test_read_ahead_and_device_cast_apply_the_same_bits(cluster, monkeypatch, world, ep):  # noqa: F811 - the cluster fixture
     snapshots = {}
-    for prefetch, device_cast in ((0, "0"), (3, "1"), (0, "1"), (3, "0")):
+    for prefetch, device_cast in ((0, "0"), (1, "1"), (0, "1"), (1, "0")):
         monkeypatch.setattr(reader_module, "_PREFETCH_STANDINS", prefetch > 0)
-        monkeypatch.setenv(reader_module.PREFETCH_THREADS_ENV, str(prefetch))
+        monkeypatch.setenv(reader_module.PREFETCH_ENV, str(prefetch))
         monkeypatch.setenv(sharded._DEVICE_CAST_ENV, device_cast)
         pair = await _pair(cluster, world, ep)
         await _apply_sequence(cluster, pair)
@@ -254,9 +253,8 @@ async def test_read_ahead_and_device_cast_apply_the_same_bits(cluster, monkeypat
         snapshots[(prefetch, device_cast)] = _snapshot(pair)
         for rank in pair["sharded"].ranks:
             commit = rank._external_full_parameter_apply_stats["commit"]
-            assert commit["prefetch_threads"] in ({0, prefetch} if prefetch else {0})
             if commit["prefetched_chunks"]:
-                assert commit["prefetch_threads"] == prefetch
+                assert commit["prefetch"]
             assert commit["fetch_wait_seconds"] >= 0 and commit["write_seconds"] >= 0
             if not prefetch:
                 assert commit["prefetched_chunks"] == 0
@@ -274,9 +272,9 @@ async def test_read_ahead_and_device_cast_apply_the_same_bits(cluster, monkeypat
 
 async def test_read_ahead_reads_each_chunk_as_often_as_the_plain_commit(cluster, monkeypatch):  # noqa: F811 - the cluster fixture
     totals = {}
-    for prefetch in (0, 2):
+    for prefetch in (0, 1):
         monkeypatch.setattr(reader_module, "_PREFETCH_STANDINS", prefetch > 0)
-        monkeypatch.setenv(reader_module.PREFETCH_THREADS_ENV, str(prefetch))
+        monkeypatch.setenv(reader_module.PREFETCH_ENV, str(prefetch))
         pair = await _pair(cluster, 4, 2)
         side = pair["sharded"]
         cluster.use(side.group)
@@ -297,7 +295,7 @@ async def test_read_ahead_reads_each_chunk_as_often_as_the_plain_commit(cluster,
         prefetched = sum(rank._external_full_parameter_apply_stats["commit"]["prefetched_chunks"] for rank in side.ranks)
         assert (prefetched > 0) == (prefetch > 0)
         totals[prefetch] = counts
-    assert totals[0] == totals[2]
+    assert totals[0] == totals[1]
 
 
 async def test_materialize_reports_its_time_split(cluster):  # noqa: F811 - the cluster fixture

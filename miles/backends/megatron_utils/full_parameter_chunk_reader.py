@@ -8,8 +8,9 @@ copied; with verify-ahead the commit's copy is the first read (S27 E3: the
 owner's copy took 0.37 s per fragment after a prepare read and 0.8 s
 without).
 
-:class:`CommitChunkReader` takes the commit's reads in copy order.  Worker
-threads ``ray.get`` each chunk and read one byte of every page the copy will
+:class:`CommitChunkReader` takes the commit's reads in copy order.  The
+two hashing threads of ``full_parameter_state._hash_pool`` (idle during a
+commit) ``ray.get`` each chunk and read one byte of every page the copy will
 use, a bounded window ahead of the copy; the copy takes the chunk from the
 reader.  The bytes are the same Ray objects (immutable) either way, so the
 commit writes the same values; only the page mapping moves off the copying
@@ -20,65 +21,47 @@ before.
 from __future__ import annotations
 
 import os
-import threading
 import time
 from collections import deque
 from collections.abc import Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Executor, Future
 
 import torch
 
-PREFETCH_THREADS_ENV = "MILES_FULL_PARAMETER_COMMIT_PREFETCH"
+PREFETCH_ENV = "MILES_FULL_PARAMETER_COMMIT_PREFETCH"
 # full_parameter_state._ZERO_COPY_ENV (that module imports this one).  With
 # zero-copy chunks off, a get deserializes a private copy of the chunk, so
 # reading ahead would hold extra host memory instead of mapping shared pages.
 _ZERO_COPY_ENV = "MILES_FULL_PARAMETER_ZERO_COPY_CHUNKS"
-# Page mapping barely scales past two threads in a Modal (gVisor) container
-# (S27 G-DZ CPU probe: 1 GiB fresh chunks, 1 thread 0.68 s, 2 threads 0.41-0.50 s,
-# 4 and 8 threads 0.5-0.95 s).
-_DEFAULT_PREFETCH_THREADS = 2
 _PAGE_BYTES = 4096
+# Chunks read ahead of the copy (and held as mappings) at most.
+DEFAULT_WINDOW = 4
 
 # ``(chunk reference, element spans inside the chunk the copy reads)``;
 # ``None`` spans: the whole chunk.
 ChunkRead = tuple[object, tuple[tuple[int, int], ...] | None]
 
-_POOL: ThreadPoolExecutor | None = None
-_POOL_THREADS = 0
-_POOL_LOCK = threading.Lock()
 # Tests set this to read ahead through an in-process stand-in of Ray, whose
 # stored tensors are already in this process's memory.
 _PREFETCH_STANDINS = False
 
 
-def prefetch_threads(ray_module) -> int:
-    """Reader threads for ``ray_module`` (``MILES_FULL_PARAMETER_COMMIT_PREFETCH``,
-    default 2; 0 reads every chunk in the copying thread, as before).  Only
-    the real Ray module with zero-copy chunks maps stored chunks lazily."""
+def prefetch_enabled(ray_module) -> bool:
+    """Whether a commit reads ahead (``MILES_FULL_PARAMETER_COMMIT_PREFETCH``,
+    default 1; 0 reads every chunk in the copying thread, as before).  Only
+    the real Ray module with zero-copy chunks maps stored chunks lazily.
 
-    raw = os.environ.get(PREFETCH_THREADS_ENV, str(_DEFAULT_PREFETCH_THREADS))
-    try:
-        threads = int(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{PREFETCH_THREADS_ENV} must be an integer, got {raw!r}") from exc
-    if not 0 <= threads <= 64:
-        raise RuntimeError(f"{PREFETCH_THREADS_ENV} must be within 0..64, got {threads}")
-    if getattr(ray_module, "__name__", None) != "ray" and not _PREFETCH_STANDINS:
-        return 0
-    if os.environ.get(_ZERO_COPY_ENV, "1") == "0":
-        return 0
-    return threads
+    The reads run on the caller's pool: page mapping barely scales past two
+    threads in a Modal (gVisor) container (S27 G-DZ CPU probe: 1 GiB fresh
+    chunks, 1 thread 0.68 s, 2 threads 0.41-0.50 s, 4 and 8 threads
+    0.5-0.95 s), which is the size of Miles' hashing pool."""
 
-
-def _pool(threads: int) -> ThreadPoolExecutor:
-    global _POOL, _POOL_THREADS
-    with _POOL_LOCK:
-        if _POOL is None or _POOL_THREADS != threads:
-            if _POOL is not None:
-                _POOL.shutdown(wait=False)
-            _POOL = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="miles-fp-commit-read")
-            _POOL_THREADS = threads
-        return _POOL
+    raw = os.environ.get(PREFETCH_ENV, "1")
+    if raw not in ("0", "1"):
+        raise RuntimeError(f"{PREFETCH_ENV} must be 0 or 1, got {raw!r}")
+    if raw == "0" or os.environ.get(_ZERO_COPY_ENV, "1") == "0":
+        return False
+    return getattr(ray_module, "__name__", None) == "ray" or _PREFETCH_STANDINS
 
 
 def touch_pages(value: object, spans: tuple[tuple[int, int], ...] | None) -> None:
@@ -105,13 +88,19 @@ class CommitChunkReader:
     itself would have raised.  ``close`` drops unstarted reads and waits for
     running ones (they only read)."""
 
-    def __init__(self, reads: Sequence[ChunkRead], *, ray_module, threads: int, window: int | None = None) -> None:
+    def __init__(
+        self,
+        reads: Sequence[ChunkRead],
+        *,
+        ray_module,
+        pool: Executor | None,
+        window: int = DEFAULT_WINDOW,
+    ) -> None:
         self._ray = ray_module
-        self._pending: deque[ChunkRead] = deque(reads if threads else ())
+        self._pool = pool if reads else None
+        self._pending: deque[ChunkRead] = deque(reads if self._pool is not None else ())
         self._inflight: deque[tuple[object, Future]] = deque()
-        self._pool = _pool(threads) if threads and reads else None
-        self._window = window if window is not None else 2 * threads
-        self.threads = threads if self._pool is not None else 0
+        self._window = window
         self.prefetched_chunks = 0
         self.read_seconds = 0.0  # reader threads: get + page reads
         self.wait_seconds = 0.0  # the copying thread waiting for chunks
@@ -167,7 +156,7 @@ class CommitChunkReader:
 
     def stats(self) -> dict[str, object]:
         return {
-            "prefetch_threads": self.threads,
+            "prefetch": self._pool is not None,
             "prefetched_chunks": self.prefetched_chunks,
             "prefetch_read_seconds": self.read_seconds,
             "fetch_wait_seconds": self.wait_seconds,

@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, replace
 import torch
 
 from miles.backends.megatron_utils import full_parameter_sharded_masters as sharded
-from miles.backends.megatron_utils.full_parameter_chunk_reader import CommitChunkReader, prefetch_threads
+from miles.backends.megatron_utils.full_parameter_chunk_reader import CommitChunkReader, prefetch_enabled
 
 
 _ROLE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
@@ -3356,10 +3356,12 @@ def commit_prepared_full_parameter_shard(
     written: dict[str, None] = {}
     write_seconds = [0.0]
     owned_write = _timed_writer(_commit_writer(layout, owned=True), write_seconds)
+    # The hashing pool is idle during a commit: it maps the next chunks while
+    # this thread copies.
     reader = CommitChunkReader(
         _commit_chunk_reads(plan, state, prepared, replica_plan),
         ray_module=ray_module,
-        threads=prefetch_threads(ray_module),
+        pool=_hash_pool() if prefetch_enabled(ray_module) else None,
     )
     try:
         for fragment, descriptor, references in zip(
