@@ -31,6 +31,7 @@ imports this one); the caller passes the tracking state and the Ray ``put``.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -47,6 +48,23 @@ if TYPE_CHECKING:
 # ``(installed policy version, local-step generation, scheduler steps)``: the
 # optimizer state a contribution is read at and may be used at.
 Tracking = tuple[int, int, int]
+
+_DEVICE_CAST_ENV = "MILES_FULL_PARAMETER_COMMIT_DEVICE_CAST"
+# Elements of every device-cast write compared bit for bit with the host cast.
+_CAST_SAMPLE_NUMEL = 4096
+
+
+def _require_host_cast_bits(model: torch.Tensor, values: torch.Tensor) -> None:
+    """The first ``_CAST_SAMPLE_NUMEL`` model elements hold the host cast of
+    ``values`` bit for bit (what the host-cast write stored there)."""
+
+    count = min(model.numel(), _CAST_SAMPLE_NUMEL)
+    if not count:
+        return
+    device_bits = model[:count].detach().to("cpu").view(torch.uint8)
+    host_bits = values[:count].to(model.dtype).view(torch.uint8)
+    if not torch.equal(device_bits, host_bits):
+        raise RuntimeError("full-parameter device cast of the master differs from the host cast")
 
 
 
@@ -87,16 +105,38 @@ class MasterRange:
         """Set parameter offsets ``[start, start + len(values))`` to ``values`` (FP32).
 
         The model gets every value (cast to its dtype, as Megatron's
-        main-to-model copy casts), the master the values inside the range."""
+        main-to-model copy casts), the master the values inside the range.
+
+        Inside the range the values cross to the master's device once and the
+        model takes the master's cast there: Megatron's main-to-model copy, and
+        exactly what :meth:`matches_model` compares.  A host-side cast instead
+        (``copy_`` of host FP32 into a device BF16 tensor casts on the host)
+        reads the host bytes twice and allocates a host BF16 copy.  Both casts
+        round to nearest even; a sample of every write is compared bit for bit
+        with the host cast (``_require_host_cast_bits``), so a disagreement
+        stops the commit as :func:`check_model` stopped the host-cast write.
+        ``MILES_FULL_PARAMETER_COMMIT_DEVICE_CAST=0`` keeps the host cast."""
 
         stop = start + values.numel()
-        self.parameter.detach().view(-1)[start:stop].copy_(values, non_blocking=False)
+        model = self.parameter.detach().view(-1)
         inside = self.overlap(start, stop)
-        if inside is not None and not self.fp32_is_model:
-            low, high = inside
-            self.fp32.detach()[low - self.start : high - self.start].copy_(
-                values[low - start : high - start], non_blocking=False
-            )
+        if inside is None or self.fp32_is_model or os.environ.get(_DEVICE_CAST_ENV, "1") == "0":
+            model[start:stop].copy_(values, non_blocking=False)
+            if inside is not None and not self.fp32_is_model:
+                low, high = inside
+                self.fp32.detach()[low - self.start : high - self.start].copy_(
+                    values[low - start : high - start], non_blocking=False
+                )
+            return
+        low, high = inside
+        master = self.fp32.detach()[low - self.start : high - self.start]
+        master.copy_(values[low - start : high - start], non_blocking=False)
+        model[low:high].copy_(master, non_blocking=False)
+        _require_host_cast_bits(model[low:high], values[low - start : high - start])
+        if start < low:
+            model[start:low].copy_(values[: low - start], non_blocking=False)
+        if high < stop:
+            model[high:stop].copy_(values[high - start :], non_blocking=False)
 
     def matches_model(self) -> bool:
         if not self.numel:

@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, replace
 import torch
 
 from miles.backends.megatron_utils import full_parameter_sharded_masters as sharded
+from miles.backends.megatron_utils.full_parameter_chunk_reader import CommitChunkReader, prefetch_threads
 
 
 _ROLE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
@@ -2321,6 +2322,14 @@ def _tracking_identity(actor) -> sharded.Tracking:
     return installed, generation, _scheduler_num_steps(actor)
 
 
+def _add_lap(spent: dict[str, float], key: str, since: float) -> float:
+    """Add the seconds since ``since`` to ``spent[key]``; returns now."""
+
+    now = time.monotonic()
+    spent[key] += now - since
+    return now
+
+
 def _export_fragment_chunks(
     fragment: FullParameterFragmentPlan,
     *,
@@ -2330,13 +2339,17 @@ def _export_fragment_chunks(
     plan_hash: str,
     ray_module,
     overlap_checks: bool = True,
+    timings: dict[str, float] | None = None,
 ) -> tuple[FullParameterFragmentDescriptor, list[object | None]]:
     """``sources``: flat FP32 tensors whose concatenation is the fragment
     payload (:func:`_fragment_sources`).  ``overlap_checks=False``: run the
     finite check and the chunk hash in this thread (callers that export several
-    fragments on the scan pool)."""
+    fragments on the scan pool).  ``timings``: adds this call's seconds of
+    copying out of the sources (``copy_out_seconds``), waiting for the finite
+    check and hashes (``check_seconds``) and storing (``put_seconds``)."""
 
     submit = _hash_pool().submit if overlap_checks else _run_now
+    spent = {"copy_out_seconds": 0.0, "check_seconds": 0.0, "put_seconds": 0.0}
     source_index = 0
     source_offset = 0
     flat_offset = 0
@@ -2348,6 +2361,7 @@ def _export_fragment_chunks(
         plan_hash,
     )
     while flat_offset < fragment.numel:
+        lap = time.monotonic()
         chunk_numel = min(max_chunk_numel, fragment.numel - flat_offset)
         chunk = torch.empty(chunk_numel, device="cpu", dtype=torch.float32)
         destination_offset = 0
@@ -2369,6 +2383,7 @@ def _export_fragment_chunks(
                 source_index += 1
                 source_offset = 0
         chunk_index = len(chunk_descriptors)
+        lap = _add_lap(spent, "copy_out_seconds", lap)
         # The finite check, the chunk hash and the fragment digest read the
         # same immutable chunk; they run concurrently and give the same bytes.
         finite = submit(_all_finite, chunk)
@@ -2392,15 +2407,20 @@ def _export_fragment_chunks(
             numel=chunk_numel,
             payload_hash=chunk_hash.result(),
         )
+        lap = _add_lap(spent, "check_seconds", lap)
         reference = put_full_parameter_chunk(ray_module, chunk)
         if reference is None:
             raise RuntimeError("Ray returned an empty full-parameter chunk reference")
+        _add_lap(spent, "put_seconds", lap)
         chunk_descriptors.append(descriptor)
         chunk_refs.append(reference)
         flat_offset += chunk_numel
         del chunk, raw
     if source_index != len(sources) or source_offset != 0:
         raise RuntimeError("full-parameter fragment did not consume every source")
+    if timings is not None:
+        for key, seconds in spent.items():
+            timings[key] = timings.get(key, 0.0) + seconds
     return (
         FullParameterFragmentDescriptor(
             fragment_id=fragment.fragment_id,
@@ -2876,16 +2896,24 @@ def materialize_full_parameter_fragments(
         actor, layout, contributions, owner=manifest.topology, fragment_ids=requested
     )
 
+    timings: list[dict[str, float]] = []
+
     def store(fragment_id: int) -> tuple[int, list[object], FullParameterFragmentDescriptor]:
         expected = descriptors[fragment_id]
+        spent: dict[str, float] = {}
+        timings.append(spent)
+        began = time.monotonic()
+        sources = _fragment_sources(fragments[fragment_id], layout, contributions=contributed, ray_module=ray_module)
+        spent["sources_seconds"] = time.monotonic() - began
         descriptor, references = _export_fragment_chunks(
             fragments[fragment_id],
-            sources=_fragment_sources(fragments[fragment_id], layout, contributions=contributed, ray_module=ray_module),
+            sources=sources,
             max_chunk_numel=expected.chunks[0].numel,
             parameter_layout_hash=plan.parameter_layout_hash,
             plan_hash=plan.plan_hash,
             ray_module=ray_module,
             overlap_checks=len(requested) <= 1,
+            timings=spent,
         )
         if fragment_id in lazy:
             if not _same_fragment_geometry(descriptor, expected):
@@ -2896,6 +2924,7 @@ def materialize_full_parameter_fragments(
 
     stored = _parallel_map(store, sorted(requested))
     checked = 0
+    model_check_started = time.monotonic()
     if lazy:
         # A lazy export compared no model parameter with its master: the
         # parameters of every fragment that leaves the actor are compared now.
@@ -2906,13 +2935,20 @@ def materialize_full_parameter_fragments(
             optimizer_owned_parameter_ids=optimizer_owned,
             ranges=layout.ranges,
         )
+    # Per-fragment seconds summed over fragments (they may run concurrently).
+    split: dict[str, float] = {}
+    for spent in timings:
+        for key, seconds in spent.items():
+            split[key] = split.get(key, 0.0) + seconds
     _note_apply_stats(
         actor,
         "materialize",
         fragments=len(stored),
         lazy_fragments=len(lazy),
         model_checked_parameters=checked,
+        model_check_seconds=time.monotonic() - model_check_started,
         seconds=time.monotonic() - started,
+        **split,
     )
     if return_descriptors:
         return tuple(stored)
@@ -3201,7 +3237,13 @@ def _copy_fragment_chunks_to_masters(
     parameter_layout_hash: str,
     plan_hash: str,
     ray_module,
+    fetch: Callable[[object], object] | None = None,
 ) -> int:
+    """Copy one fragment's stored chunks into ``write``; returns the
+    parameters it completed.  ``fetch``: reads a chunk ref (default
+    ``ray_module.get``; the commit passes its :class:`CommitChunkReader`)."""
+
+    fetch = fetch or ray_module.get
     members = fragment.members(numel_by_wire)
     member_index = 0
     member_offset = 0  # elements of the current member already written
@@ -3214,7 +3256,7 @@ def _copy_fragment_chunks_to_masters(
         if is_deferred_full_parameter_chunk(reference):
             raise RuntimeError("a deferred full-parameter chunk has no stored bytes to copy")
         value = _validate_cpu_chunk(
-            ray_module.get(reference),
+            fetch(reference),
             chunk_descriptor,
             fragment_id=fragment.fragment_id,
             verify_values=False,
@@ -3312,36 +3354,48 @@ def commit_prepared_full_parameter_shard(
     count = 0
     copied_fragments = 0
     written: dict[str, None] = {}
-    for fragment, descriptor, references in zip(
-        plan.fragments,
-        state.fragments,
-        state.chunk_refs,
-        strict=True,
-    ):
-        if fragment.fragment_id in prepared.resident_fragment_ids:
-            count += _fragment_completed_parameters(fragment, numel_by_wire)
-            continue
-        copied_fragments += 1
-        written.update(dict.fromkeys(fragment.wire_names))
-        count += _copy_fragment_chunks_to_masters(
-            fragment,
-            descriptor,
-            references,
-            numel_by_wire=numel_by_wire,
-            write=_commit_writer(layout, owned=True),
-            parameter_layout_hash=state.parameter_layout_hash,
-            plan_hash=state.plan_hash,
-            ray_module=ray_module,
-        )
-    if count != prepared.parameter_tensor_count or count != len(specs):
-        raise RuntimeError("full-parameter chunked apply is incomplete")
-    replica_copied = replicas.copy_replica_chunks(
-        replica_plan,
-        prepared.replica_states,
-        skip=prepared.replica_resident_ids,
-        write=_commit_writer(layout, owned=False),
+    write_seconds = [0.0]
+    owned_write = _timed_writer(_commit_writer(layout, owned=True), write_seconds)
+    reader = CommitChunkReader(
+        _commit_chunk_reads(plan, state, prepared, replica_plan),
         ray_module=ray_module,
+        threads=prefetch_threads(ray_module),
     )
+    try:
+        for fragment, descriptor, references in zip(
+            plan.fragments,
+            state.fragments,
+            state.chunk_refs,
+            strict=True,
+        ):
+            if fragment.fragment_id in prepared.resident_fragment_ids:
+                count += _fragment_completed_parameters(fragment, numel_by_wire)
+                continue
+            copied_fragments += 1
+            written.update(dict.fromkeys(fragment.wire_names))
+            count += _copy_fragment_chunks_to_masters(
+                fragment,
+                descriptor,
+                references,
+                numel_by_wire=numel_by_wire,
+                write=owned_write,
+                parameter_layout_hash=state.parameter_layout_hash,
+                plan_hash=state.plan_hash,
+                ray_module=ray_module,
+                fetch=reader.get,
+            )
+        if count != prepared.parameter_tensor_count or count != len(specs):
+            raise RuntimeError("full-parameter chunked apply is incomplete")
+        replica_copied = replicas.copy_replica_chunks(
+            replica_plan,
+            prepared.replica_states,
+            skip=prepared.replica_resident_ids,
+            write=_timed_writer(_commit_writer(layout, owned=False), write_seconds),
+            ray_module=ray_module,
+            fetch=reader.get,
+        )
+    finally:
+        reader.close()
     copied_seconds = time.monotonic() - started
     by_wire_name = _parameters_by_wire_name(named_parameters, specs)
     written_names = dict.fromkeys(by_wire_name[wire_name][0] for wire_name in written)
@@ -3392,11 +3446,50 @@ def commit_prepared_full_parameter_shard(
         replica_copied_fragments=replica_copied,
         replica_resident_fragments=len(prepared.replica_resident_ids),
         copy_seconds=copied_seconds,
+        write_seconds=write_seconds[0],
         seconds=time.monotonic() - started,
+        **reader.stats(),
         **finish_stats,
     )
     del actor._external_full_parameter_prepared_cut
     return count
+
+
+def _timed_writer(write: MasterWriter, total: list[float]) -> MasterWriter:
+    """``write`` that adds its own seconds to ``total[0]`` (the commit's write
+    split: host-to-device copies and casts, apart from reading chunks)."""
+
+    def timed(key: str, start: int, values: torch.Tensor) -> None:
+        began = time.monotonic()
+        write(key, start, values)
+        total[0] += time.monotonic() - began
+
+    return timed
+
+
+def _commit_chunk_reads(
+    plan: FullParameterOwnerFragmentPlan,
+    state: FullParameterChunkedShardState,
+    prepared: _PreparedFullParameterChunkedShard,
+    replica_plan,
+) -> list[tuple[object, tuple[tuple[int, int], ...] | None]]:
+    """The chunks the commit copies, in its copy order: every stored chunk of
+    each non-resident owned fragment, then the replica rows' chunks with the
+    spans they copy (``replicas.replica_chunk_reads``)."""
+
+    from miles.backends.megatron_utils import full_parameter_replicas as replicas  # import cycle
+
+    reads: list[tuple[object, tuple[tuple[int, int], ...] | None]] = [
+        (reference, None)
+        for fragment, references in zip(plan.fragments, state.chunk_refs, strict=True)
+        if fragment.fragment_id not in prepared.resident_fragment_ids
+        for reference in references
+        if not is_deferred_full_parameter_chunk(reference)
+    ]
+    reads.extend(
+        replicas.replica_chunk_reads(replica_plan, prepared.replica_states, skip=prepared.replica_resident_ids)
+    )
+    return reads
 
 
 _PARTIAL_COMMIT_ENV = "MILES_FULL_PARAMETER_PARTIAL_COMMIT"
