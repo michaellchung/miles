@@ -588,6 +588,27 @@ def replica_names_to_copy(
     return tuple(names)
 
 
+def replica_chunk_reads(
+    replica_plan: ReplicaPlan | None,
+    states: Sequence[FullParameterChunkedShardState],
+    *,
+    skip: frozenset[ReplicaFragmentKey],
+) -> list[tuple[object, tuple[tuple[int, int], ...]]]:
+    """``(chunk ref, element spans inside the chunk)`` of every stored chunk
+    :func:`copy_replica_chunks` reads, in its order (deferred chunks left out:
+    the copy refuses them)."""
+
+    if replica_plan is None:
+        return []
+    reads = []
+    for _source, _state, fragment, descriptor, refs in _rows_to_read(replica_plan, states, skip):
+        for chunk_index, chunk, parts in iter_chunk_overlaps(fragment, descriptor):
+            if not is_deferred_full_parameter_chunk(refs[chunk_index]):
+                spans = tuple((start - chunk.flat_offset, stop - chunk.flat_offset) for _copy, start, stop in parts)
+                reads.append((refs[chunk_index], spans))
+    return reads
+
+
 def copy_replica_chunks(
     replica_plan: ReplicaPlan | None,
     states: Sequence[FullParameterChunkedShardState],
@@ -595,22 +616,25 @@ def copy_replica_chunks(
     skip: frozenset[ReplicaFragmentKey],
     write: Callable[[str, int, torch.Tensor], None],
     ray_module,
+    fetch: Callable[[object], object] | None = None,
 ) -> int:
     """Copy the owner bytes of every non-resident replica fragment; returns fragments copied.
 
     ``write(name, start, values)`` stores ``values`` at flat offsets
     ``[start, start + len(values))`` of local parameter ``name``'s master
-    (``full_parameter_state._commit_writer``)."""
+    (``full_parameter_state._commit_writer``).  ``fetch`` reads a chunk ref
+    (default ``ray_module.get``; the commit passes its chunk reader)."""
 
     if replica_plan is None:
         return 0
+    fetch = fetch or ray_module.get
     copied = 0
     for source, state, fragment, descriptor, refs in _rows_to_read(replica_plan, states, skip):
         for chunk_index, chunk, parts in iter_chunk_overlaps(fragment, descriptor):
             if is_deferred_full_parameter_chunk(refs[chunk_index]):
                 raise RuntimeError("a deferred full-parameter chunk has no stored bytes to copy")
             value = _validate_cpu_chunk(
-                ray_module.get(refs[chunk_index]),
+                fetch(refs[chunk_index]),
                 chunk,
                 fragment_id=fragment.fragment_id,
                 verify_values=False,
