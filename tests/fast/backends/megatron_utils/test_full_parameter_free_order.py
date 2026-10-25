@@ -96,3 +96,13 @@ def test_an_owner_map_must_keep_the_replica_group_inside_the_writers():
         fps._installed_owners(named, replication, {"a.weight": (0, (0, 2))})
     with pytest.raises(RuntimeError, match="exactly this rank"):
         fps._installed_owners(named, replication, {})
+
+
+def test_a_gated_fc1_reports_its_gate_and_up_blocks():
+    parameter = torch.nn.Parameter(torch.zeros(6, 4))
+    parameter.tensor_model_parallel, parameter.partition_dim, parameter.partition_stride = True, 0, 1
+    name = "decoder.layers.0.mlp.linear_fc1.weight"
+    assert fps._parameter_partition(name, parameter, gated=True).partition_sizes == (3, 3)
+    assert fps._parameter_partition(name, parameter).partition_sizes == (6,)
+    parameter.allreduce = False  # an expert: whole (expert tensor parallelism 1)
+    assert fps._parameter_partition(name, parameter, gated=True).partition_dim is None

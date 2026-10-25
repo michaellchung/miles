@@ -1705,9 +1705,13 @@ def _tensor_parallel_ranks() -> tuple[tuple[int, ...], int]:
     return ranks, expert_tp
 
 
-def _parameter_partition(name: str, parameter: torch.nn.Parameter) -> FullParameterPartition:
+def _parameter_partition(name: str, parameter: torch.nn.Parameter, *, gated: bool = False) -> FullParameterPartition:
     """Megatron's tensor-parallel attributes of one parameter (``tensor_model_parallel``,
-    ``partition_dim``, ``partition_stride``, ``partition_sizes``)."""
+    ``partition_dim``, ``partition_stride``, ``partition_sizes``).
+
+    ``gated`` (``--swiglu``): a dense ``linear_fc1`` packs the gate and the up
+    projection, each split by tensor parallelism (Megatron's swiglu sharded
+    factory), so its local rows are two blocks."""
 
     shape = tuple(int(dimension) for dimension in parameter.shape)
     expert = not bool(getattr(parameter, "allreduce", True))
@@ -1717,6 +1721,8 @@ def _parameter_partition(name: str, parameter: torch.nn.Parameter) -> FullParame
         raise RuntimeError(f"{name!r} has a strided tensor-parallel partition; a shape-free layout needs stride 1")
     dim = int(getattr(parameter, "partition_dim", 0))
     sizes = getattr(parameter, "partition_sizes", None)
+    if sizes is None and gated and dim == 0 and name.endswith("linear_fc1.weight") and shape[0] % 2 == 0:
+        sizes = (shape[0] // 2, shape[0] // 2)
     sizes = (shape[dim],) if sizes is None else tuple(int(size) for size in sizes)
     return FullParameterPartition(name=name, shape=shape, expert=False, partition_dim=dim, partition_sizes=sizes)
 
@@ -1743,7 +1749,10 @@ def full_parameter_partition_report(
         tensor_parallel_ranks=tp_ranks,
         expert_tensor_parallel_size=expert_tp,
         parameters=tuple(
-            sorted(_parameter_partition(name, parameter) for name, parameter in named_parameters)
+            sorted(
+                _parameter_partition(name, parameter, gated=bool(getattr(actor.args, "swiglu", False)))
+                for name, parameter in named_parameters
+            )
         ),
     )
 
