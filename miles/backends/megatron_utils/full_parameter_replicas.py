@@ -75,6 +75,11 @@ class ReplicaCopy:
     name: str  # local parameter name
     start: int  # flat element range of the member inside the parameter
     stop: int
+    # False: this rank writes the owner's bytes but its FP32 master range is
+    # not part of the owner's (a parameter tensor parallelism does not split,
+    # held by another tensor-parallel rank's data-parallel group under a
+    # shape-free layout), so it contributes nothing to the owner's export.
+    contributes: bool = True
 
     @property
     def numel(self) -> int:
@@ -127,8 +132,14 @@ def build_replica_plan(
     manifest: FullParameterShardManifest,
     plan: FullParameterOwnerFragmentPlan,
     replica_sources: Sequence[tuple[FullParameterShardManifest, FullParameterOwnerFragmentPlan]],
+    master_ranks: Mapping[str, tuple[int, ...]] | None = None,
 ) -> ReplicaPlan | None:
-    """The replica plan of the rank ``manifest`` describes; None when it holds no replica."""
+    """The replica plan of the rank ``manifest`` describes; None when it holds no replica.
+
+    ``master_ranks``: this rank's data-parallel group of each parameter
+    (``FullParameterReplication.ranks_for``).  A replica whose owner is outside
+    that group writes the owner's bytes but contributes no master range
+    (``ReplicaCopy.contributes``); None: every owner is inside it."""
 
     replicated = manifest.replicated_holdings()
     by_owner: dict[int, dict[str, FullParameterHolding]] = {}
@@ -142,7 +153,17 @@ def build_replica_plan(
     sources = tuple(
         sorted(
             (
-                _replica_source(owner_manifest, owner_plan, by_owner[owner_manifest.global_rank], plan)
+                _replica_source(
+                    owner_manifest,
+                    owner_plan,
+                    by_owner[owner_manifest.global_rank],
+                    plan,
+                    contributing=frozenset(
+                        name
+                        for name in by_owner[owner_manifest.global_rank]
+                        if master_ranks is None or owner_manifest.global_rank in master_ranks[name]
+                    ),
+                )
                 for owner_manifest, owner_plan in replica_sources
             ),
             key=lambda source: source.topology,
@@ -156,6 +177,8 @@ def _replica_source(
     owner_plan: FullParameterOwnerFragmentPlan,
     replicas: Mapping[str, FullParameterHolding],
     plan: FullParameterOwnerFragmentPlan,
+    *,
+    contributing: frozenset[str] | None = None,
 ) -> ReplicaSource:
     _validate_fragment_plan_against_manifest(owner_plan, owner_manifest)
     if owner_plan.parameter_layout_hash != plan.parameter_layout_hash:
@@ -166,24 +189,37 @@ def _replica_source(
             raise RuntimeError(f"full-parameter replica {name!r} disagrees with its owner's holding")
     spec_names = {spec.wire_name: spec.name for spec in owner_manifest.specs}
     numel_by_wire = {spec.wire_name: spec.numel for spec in owner_manifest.specs}
-    fragments, covered = [], {name: 0 for name in replicas}
+    fragments, covered = [], {name: [] for name in replicas}
     for fragment in owner_plan.fragments:
         copies, offset = [], 0
         for wire_name, start, stop in fragment.members(numel_by_wire):
             name = spec_names[wire_name]
             if name in replicas:
-                # The owner plan tiles each parameter in order (checked above).
-                if start != covered[name]:
-                    raise RuntimeError(f"full-parameter replica {name!r} ranges do not tile the parameter")
-                covered[name] = stop
-                copies.append(ReplicaCopy(fragment_offset=offset, name=name, start=start, stop=stop))
+                covered[name].append((start, stop))
+                copies.append(
+                    ReplicaCopy(
+                        fragment_offset=offset,
+                        name=name,
+                        start=start,
+                        stop=stop,
+                        contributes=contributing is None or name in contributing,
+                    )
+                )
             offset += stop - start
         if copies:
             fragments.append(
                 ReplicaFragment(fragment_id=fragment.fragment_id, numel=fragment.numel, copies=tuple(copies))
             )
     for name, holding in replicas.items():
-        if covered[name] != _numel(holding.shape):
+        # The owner plan covers each parameter exactly once (checked above);
+        # a canonical-order plan in order, a free-order plan in any order.
+        spans = covered[name]
+        cursor = 0
+        for start, stop in sorted(spans) if owner_plan.free_member_order else spans:
+            if start != cursor:
+                raise RuntimeError(f"full-parameter replica {name!r} ranges do not tile the parameter")
+            cursor = stop
+        if cursor != _numel(holding.shape):
             raise RuntimeError(f"full-parameter owner plan does not cover replica {name!r}")
     return ReplicaSource(
         topology=owner_manifest.topology,
