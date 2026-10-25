@@ -2949,6 +2949,66 @@ def _validate_chunked_shard_against_plan(
             raise RuntimeError("full-parameter chunked fragment identity changed")
 
 
+def verify_stored_fragment_chunks(
+    fragment: FullParameterFragmentDescriptor,
+    references: Sequence[object],
+    *,
+    parameter_layout_hash: str,
+    plan_hash: str,
+    ray_module=None,
+    overlap_checks: bool = True,
+) -> None:
+    """Check the stored chunks of one fragment against its descriptor: each
+    chunk is a well-formed finite FP32 CPU tensor with its chunk hash, and
+    their concatenation has the fragment's payload hash.  Raises ValueError
+    otherwise.  A prepare runs it on the trainer; a caller that runs it
+    earlier (off the trainer) names the fragment in ``verified_fragments``.
+    ``overlap_checks=False``: run the chunk checks in this thread (callers
+    that verify several fragments on the scan pool)."""
+
+    ray_module = _resolve_ray_module(ray_module)
+    fragment_digest = _fragment_hasher(fragment.fragment_id, parameter_layout_hash, plan_hash)
+    for descriptor, reference in zip(fragment.chunks, references, strict=True):
+        raw = ray_module.get(reference)
+        checked = (_hash_pool().submit if overlap_checks else _run_now)(
+            _validate_cpu_chunk,
+            raw,
+            descriptor,
+            fragment_id=fragment.fragment_id,
+            verify_values=True,
+            parameter_layout_hash=parameter_layout_hash,
+            plan_hash=plan_hash,
+        )
+        if isinstance(raw, torch.Tensor) and raw.device.type == "cpu" and raw.dtype == torch.float32 and raw.ndim == 1 and raw.is_contiguous():
+            fragment_digest.update(_tensor_bytes(raw))
+            checked.result()
+        else:
+            fragment_digest.update(_tensor_bytes(checked.result()))
+        del raw, checked
+    if fragment_digest.hexdigest() != fragment.payload_hash:
+        raise ValueError("full-parameter fragment hash changed")
+
+
+def _verified_fragment_ids(
+    verified_fragments: Mapping[int, str] | None,
+    fragments: Sequence[FullParameterFragmentDescriptor],
+) -> frozenset[int]:
+    """IDs of ``fragments`` whose payload hash ``verified_fragments`` names exactly."""
+
+    if not verified_fragments:
+        return frozenset()
+    if not isinstance(verified_fragments, Mapping) or any(
+        isinstance(key, bool) or not isinstance(key, int) or not isinstance(value, str)
+        for key, value in verified_fragments.items()
+    ):
+        raise ValueError("full-parameter verified fragments must map fragment IDs to payload hashes")
+    return frozenset(
+        fragment.fragment_id
+        for fragment in fragments
+        if verified_fragments.get(fragment.fragment_id) == fragment.payload_hash
+    )
+
+
 def prepare_full_parameter_chunked_shard(
     actor,
     state: FullParameterChunkedShardState,
@@ -2958,6 +3018,7 @@ def prepare_full_parameter_chunked_shard(
     ray_module=None,
     skip_resident: bool = False,
     replica_states: Sequence[FullParameterChunkedShardState] = (),
+    verified_fragments: Mapping[int, str] | None = None,
 ) -> int:
     """Validate every immutable chunk and stage only its refs for later commit.
 
@@ -2970,7 +3031,16 @@ def prepare_full_parameter_chunked_shard(
 
     ``replica_states``: the cut's shards of the owners whose parameters this
     rank replicates (data-parallel replicas); the chunks a commit copies into
-    the replicas are checked here the same way, and the same skip applies."""
+    the replicas are checked here the same way, and the same skip applies.
+
+    ``verified_fragments``: ``{fragment ID: fragment payload hash}`` whose
+    stored chunks the caller already checked with
+    :func:`verify_stored_fragment_chunks` (the same finite check, chunk
+    hashes and fragment digest, run off the trainer before this apply).  A
+    row whose descriptor carries exactly that payload hash is not read here,
+    neither for the owner nor for a replica; any other row is checked as
+    usual.  Ray objects are immutable, so the commit copies the bytes that
+    were checked."""
 
     from miles.backends.megatron_utils import full_parameter_replicas as replicas  # import cycle
 
@@ -3032,10 +3102,11 @@ def prepare_full_parameter_chunked_shard(
         if resident_record is None:
             resident_record = forced_record
         resident = resident | deferred | lazy
+    verified = _verified_fragment_ids(verified_fragments, state.fragments)
     rows = [
         (fragment, references)
         for fragment, references in zip(state.fragments, state.chunk_refs, strict=True)
-        if fragment.fragment_id not in resident
+        if fragment.fragment_id not in resident and fragment.fragment_id not in verified
     ]
     # One fragment: its finite check and chunk hash overlap its digest on the
     # hash pool.  Several: each scan worker verifies one fragment serially.
@@ -3043,30 +3114,14 @@ def prepare_full_parameter_chunked_shard(
 
     def verify(row) -> None:
         fragment, references = row
-        fragment_digest = _fragment_hasher(
-            fragment.fragment_id,
-            state.parameter_layout_hash,
-            state.plan_hash,
+        verify_stored_fragment_chunks(
+            fragment,
+            references,
+            parameter_layout_hash=state.parameter_layout_hash,
+            plan_hash=state.plan_hash,
+            ray_module=ray_module,
+            overlap_checks=overlap_checks,
         )
-        for descriptor, reference in zip(fragment.chunks, references, strict=True):
-            raw = ray_module.get(reference)
-            checked = (_hash_pool().submit if overlap_checks else _run_now)(
-                _validate_cpu_chunk,
-                raw,
-                descriptor,
-                fragment_id=fragment.fragment_id,
-                verify_values=True,
-                parameter_layout_hash=state.parameter_layout_hash,
-                plan_hash=state.plan_hash,
-            )
-            if isinstance(raw, torch.Tensor) and raw.device.type == "cpu" and raw.dtype == torch.float32 and raw.ndim == 1 and raw.is_contiguous():
-                fragment_digest.update(_tensor_bytes(raw))
-                checked.result()
-            else:
-                fragment_digest.update(_tensor_bytes(checked.result()))
-            del raw, checked
-        if fragment_digest.hexdigest() != fragment.payload_hash:
-            raise ValueError("full-parameter fragment hash changed")
 
     # Resident fragments: the masters already hold these exact bytes; commit
     # skips them.  The others are independent; verify them concurrently.
@@ -3074,13 +3129,21 @@ def prepare_full_parameter_chunked_shard(
     replica_resident, replica_record = replicas.resident_replica_fragments(
         actor, replica_plan, replica_states, skip_resident=skip_resident
     )
-    replica_read = replicas.verify_replica_chunks(replica_plan, replica_states, skip=replica_resident, ray_module=ray_module)
+    replica_verified = frozenset(
+        (replica_state.topology, fragment_id)
+        for replica_state in replica_states
+        for fragment_id in _verified_fragment_ids(verified_fragments, replica_state.fragments)
+    )
+    replica_read = replicas.verify_replica_chunks(
+        replica_plan, replica_states, skip=replica_resident | replica_verified, ray_module=ray_module
+    )
     _note_apply_stats(
         actor,
         "prepare",
         fragments=len(state.fragments),
         resident_fragments=len(resident),
-        read_fragments=len(state.fragments) - len(resident),
+        read_fragments=len(rows),
+        verified_ahead_fragments=len(verified - resident),
         replica_resident_fragments=len(replica_resident),
         replica_read_fragments=replica_read,
         seconds=time.monotonic() - started,

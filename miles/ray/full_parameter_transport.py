@@ -70,6 +70,9 @@ FULL_PARAMETER_TRANSPORT_FEATURES = frozenset(
         # content descriptors, delta reads through such a descriptor, and a
         # local-step receipt without the whole-model model/master check.
         "lazy_export",
+        # An apply may name fragments whose stored chunks the caller already
+        # verified (``verify_stored_fragment_chunks``); their prepare reads none.
+        "verified_apply",
     }
 )
 
@@ -968,6 +971,7 @@ async def apply_chunked_cut(
     commit_token: str | None = None,
     max_commit_attempts: int = 3,
     skip_resident_fragments: bool = False,
+    verified_fragments: Mapping[int, str] | None = None,
 ) -> int:
     """Prepare, idempotently converge, then finalize every owner rank.
 
@@ -975,7 +979,12 @@ async def apply_chunked_cut(
     cut with some fragments replaced; each rank reads and copies only the
     fragments whose bytes its masters do not already hold (see
     ``prepare_full_parameter_chunked_shard``).  The applied values are the
-    same either way."""
+    same either way.
+
+    ``verified_fragments``: ``{fragment ID: payload hash}`` of fragments of
+    ``cut`` whose stored chunks the caller already checked with
+    ``verify_stored_fragment_chunks``; no rank reads them in its prepare.
+    The applied values are the same either way."""
 
     _validate_chunked_cut(cut)
     if cut.local_step_generation != 0:
@@ -1000,6 +1009,7 @@ async def apply_chunked_cut(
         },
         commit_token=token,
         **({"skip_resident": True} if skip_resident_fragments else {}),
+        **({"verified_fragments": dict(verified_fragments)} if verified_fragments else {}),
     )
     prepare_failure = _first_failure(prepare_results, expected_positive=True)
     if prepare_failure is not None:
