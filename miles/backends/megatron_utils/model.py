@@ -370,6 +370,10 @@ def forward_only(
 
             set_tokens_per_adapter_slot(model, batch["adapter_token_counts"])
 
+        from miles.utils.replay_base import stage_static_replays
+
+        stage_static_replays()
+
         output_tensor = model(
             input_ids=tokens,
             position_ids=None,
@@ -510,11 +514,12 @@ def run_forward_backward_pass(
 
             set_tokens_per_adapter_slot(model, batch["adapter_token_counts"])
 
-        from miles.utils.replay_base import all_replay_managers
+        from miles.utils.replay_base import all_replay_managers, stage_static_replays
 
         old_stages = [m.stage for m in all_replay_managers]
         for m in all_replay_managers:
             m.stage = "replay_forward"
+        stage_static_replays()
 
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"

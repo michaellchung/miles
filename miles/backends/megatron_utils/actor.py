@@ -38,7 +38,7 @@ from miles.utils.memory_utils import clear_memory, print_memory
 from miles.utils.object_store import StoreObjectRef, ValueSpec
 from miles.utils.processing_utils import load_tokenizer
 from miles.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
-from miles.utils.replay_base import all_replay_managers, routing_replay_manager
+from miles.utils.replay_base import all_replay_managers, routing_replay_manager, static_replay_capacity
 from miles.utils.rollout_checkpoint import rollout_hf_checkpoint
 from miles.utils.test_utils.ft_test_actions import FTTestActionActorExecutor
 from miles.utils.timer import Timer, inverse_timer, timer
@@ -197,6 +197,12 @@ class MegatronTrainRayActor(TrainRayActor):
             for m in all_replay_managers:
                 m.enabled = getattr(self.args, f"use_{m.name}_replay", False)
                 m.enable_check_replay_result = m.enabled and self.args.ci_test
+            if routing_replay_manager.enabled and getattr(self.args, "routing_replay_static_buffer", False):
+                routing_replay_manager.enable_static_buffer(static_replay_capacity(self.args))
+                logger.info(
+                    "routing replay: static device rows, capacity %d tokens",
+                    routing_replay_manager.static_buffer.capacity,
+                )
 
         checkpointing_context = None
         if recv_ckpt_src_rank is not None:

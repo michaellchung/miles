@@ -40,7 +40,7 @@ from miles.utils.object_store_config import (
     compute_mooncake_init_kwargs_from_env,
     compute_mooncake_init_kwargs_vanilla,
 )
-from miles.utils.replay_base import reject_router_fusion_with_routing_replay
+from miles.utils.replay_base import reject_router_fusion_with_routing_replay, validate_static_replay_args
 from miles.utils.run_uuid import RUN_UUID_LENGTH, generate_run_uuid, validate_run_uuid
 from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
 from miles.utils.workers.argv_utils import with_relax_parser_required_args, with_suppressed_parser_help
@@ -2672,6 +2672,27 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--routing-replay-static-buffer",
+                action="store_true",
+                default=False,
+                help=(
+                    "Routing replay (R3) reads the replayed routes from resident device rows that are filled "
+                    "once per micro batch before its forward (one async copy of all layers), instead of a "
+                    "host-to-device copy inside every router call. Needed for CUDA graphs that capture the MoE "
+                    "router (--cuda-graph-modules moe_router); pipeline parallel size 1 only."
+                ),
+            )
+            parser.add_argument(
+                "--routing-replay-static-capacity",
+                type=int,
+                default=None,
+                help=(
+                    "Rows of the --routing-replay-static-buffer device buffer (never reallocated). Default: the "
+                    "largest of --max-tokens-per-gpu, --log-probs-max-tokens-per-gpu and --thd-bucket-sizes, "
+                    "rounded up to the pad size."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-sample-filter-path",
                 type=str,
                 default=None,
@@ -4100,6 +4121,7 @@ def miles_validate_args(args):
     # moe_router_fusion is a Megatron flag (absent on the FSDP backend); the bridge path checks the provider again
     reject_router_fusion_with_routing_replay(router_fusion=getattr(args, "moe_router_fusion", False), args=args)
     _validate_thd_bucket_sizes(args)
+    validate_static_replay_args(args)
 
     args.rollout_external = _compute_rollout_external(args)
     args.custom_inference_engine_provider_path = _compute_custom_inference_engine_provider_path(args)

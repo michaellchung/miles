@@ -129,6 +129,7 @@ def apply_bridge_local_cuda_graph_args(provider, args) -> None:
         return
     if not getattr(args, "te_rng_tracker", False):
         raise ValueError("--cuda-graph-impl local needs --te-rng-tracker (the CUDA-graph-safe RNG tracker)")
+    _reject_router_graph_without_static_replay(args)
     for field, attr in BRIDGE_LOCAL_CUDA_GRAPH_FIELDS.items():
         if not hasattr(provider, field):
             raise AttributeError(f"bridge provider {type(provider).__name__} has no field {field!r}")
@@ -136,6 +137,21 @@ def apply_bridge_local_cuda_graph_args(provider, args) -> None:
     from miles.backends.megatron_utils import cuda_graph_fallback
 
     cuda_graph_fallback.install()
+
+
+def _reject_router_graph_without_static_replay(args) -> None:
+    """A graph that captures the MoE router (modules moe_router / moe_preprocess / moe, or an empty list =
+    whole layers) would fix the first micro batch's replayed routes: the per-layer R3 path copies them from
+    host memory inside the router. Routing replay then needs --routing-replay-static-buffer."""
+    replay = getattr(args, "use_routing_replay", False) or getattr(args, "use_rollout_routing_replay", False)
+    if not replay or getattr(args, "routing_replay_static_buffer", False):
+        return
+    modules = [getattr(m, "name", str(m)) for m in (getattr(args, "cuda_graph_modules", None) or [])]
+    if not modules or any(m in ("moe_router", "moe_preprocess", "moe") for m in modules):
+        raise ValueError(
+            f"--cuda-graph-modules {modules or '(all)'} captures the MoE router while routing replay is on; "
+            "add --routing-replay-static-buffer (the replayed routes are then read from fixed device rows)"
+        )
 
 
 def _reject_bridge_cuda_graphs(*, cuda_graph_impl) -> None:

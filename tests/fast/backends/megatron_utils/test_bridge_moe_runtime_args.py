@@ -247,6 +247,42 @@ def test_local_cuda_graphs_need_the_te_rng_tracker(apply_bridge_runtime_config: 
         apply_bridge_runtime_config(_NemotronHProvider(), args)
 
 
+@pytest.mark.parametrize("modules", [["mamba", "attn", "moe_router"], ["moe_preprocess"], []])
+def test_router_graphs_under_replay_need_the_static_replay_buffer(
+    apply_bridge_runtime_config: Callable, monkeypatch: pytest.MonkeyPatch, modules: list
+) -> None:
+    """A graph around the MoE router would freeze the first micro batch's replayed routes."""
+    from miles.backends.megatron_utils import cuda_graph_fallback
+
+    monkeypatch.setattr(cuda_graph_fallback, "install", lambda: True)
+    common = dict(cuda_graph_impl="local", cuda_graph_modules=modules, cuda_graph_warmup_steps=3, te_rng_tracker=True)
+    with pytest.raises(ValueError, match="routing-replay-static-buffer"):
+        apply_bridge_runtime_config(
+            _NemotronHProvider(), _megatron_args(use_rollout_routing_replay=True, use_routing_replay=True, **common)
+        )
+    provider = _NemotronHProvider()
+    apply_bridge_runtime_config(
+        provider,
+        _megatron_args(
+            use_rollout_routing_replay=True, use_routing_replay=True, routing_replay_static_buffer=True, **common
+        ),
+    )
+    assert provider.cuda_graph_modules == modules
+
+
+def test_mamba_and_attention_graphs_need_no_static_replay_buffer(
+    apply_bridge_runtime_config: Callable, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from miles.backends.megatron_utils import cuda_graph_fallback
+
+    monkeypatch.setattr(cuda_graph_fallback, "install", lambda: True)
+    args = _megatron_args(
+        cuda_graph_impl="local", cuda_graph_modules=["mamba", "attn"], cuda_graph_warmup_steps=3,
+        te_rng_tracker=True, use_rollout_routing_replay=True, use_routing_replay=True,
+    )
+    apply_bridge_runtime_config(_NemotronHProvider(), args)
+
+
 def test_the_log_line_names_the_effective_values_and_the_copied_flags() -> None:
     provider = _NemotronHProvider(moe_token_dispatcher_type="flex")
     args = _megatron_args(moe_flex_dispatcher_backend="deepepv2", moe_flex_dispatcher_num_sms=32)

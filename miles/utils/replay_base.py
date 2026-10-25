@@ -82,6 +82,50 @@ def _spread_padding_routes(top_indices: torch.Tensor, num_experts: int) -> torch
     return (row * topk + col) % num_experts
 
 
+class StaticReplayBuffer:
+    """Resident device rows that the top-k hook reads instead of popping a host copy.
+
+    Path (d) of SESSION27/CUDA-GRAPH.md: a CUDA graph that captures the MoE router fixes the
+    address it reads the replayed routes from, and it may not copy from host memory or read a
+    value back on the host.  So every micro batch is staged once, before its forward and outside
+    any graph: one non-blocking host-to-device copy of all layers' routes (a pinned
+    ``[slots, n, topk]`` stack per micro batch, built once per rollout from the per-layer lists)
+    into ``device_rows[:, :n]``.  Layer ``slot`` then reads ``device_rows[slot, :n]``: the same
+    address for every micro batch with the same ``n`` (one THD bucket).
+
+    The forward and the recompute in the backward of a micro batch read the same rows.  That
+    holds without pipeline parallelism: the backward of micro batch i runs before micro batch
+    i + 1 is staged, and the copy is queued on the stream that runs the router.  The device rows
+    are allocated once (``capacity`` rows) and never reallocated, so a captured address stays valid.
+    """
+
+    def __init__(self, capacity: int, device=None, pin_memory: bool = True):
+        if capacity <= 0:
+            raise ValueError(f"static replay buffer capacity must be positive, got {capacity}")
+        self.capacity = int(capacity)
+        self.device = device
+        self.pin_memory = pin_memory
+        self.device_rows: torch.Tensor | None = None
+        self.staged_tokens: int | None = None
+        self.host_stacks: list[torch.Tensor] | None = None
+        self.next_index = 0
+
+    def reset_rollout(self) -> None:
+        self.host_stacks = None
+        self.next_index = 0
+        self.staged_tokens = None
+
+    def rows(self, slot: int, num_tokens: int) -> torch.Tensor:
+        if self.staged_tokens is None:
+            raise RuntimeError("static replay buffer read before any micro batch was staged")
+        if num_tokens != self.staged_tokens:
+            raise AssertionError(
+                f"rank {_get_rank()}: router sees {num_tokens} tokens but the staged micro batch has "
+                f"{self.staged_tokens} rows"
+            )
+        return self.device_rows[slot, :num_tokens]
+
+
 class BaseReplayManager:
     name: str = ""
     filename: str = ""
@@ -96,9 +140,12 @@ class BaseReplayManager:
         self.enabled = False
         self.stage = "fallthrough"
         self.register_replay_list_func = None
+        # Set by enable_static_buffer (--routing-replay-static-buffer); None = the per-layer pop path.
+        self.static_buffer: StaticReplayBuffer | None = None
 
     def create_replay(self, stream_idx: int | None = None) -> Replay:
         replay = Replay(stream_idx=stream_idx)
+        replay.static_slot = len(self.replays)
         self.replays.append(replay)
         return replay
 
@@ -111,10 +158,68 @@ class BaseReplayManager:
     def clear_all(self):
         for replay in self.replays:
             replay.clear()
+        if self.static_buffer is not None:
+            self.static_buffer.reset_rollout()
 
     def clear_all_forward(self):
         for replay in self.replays:
             replay.clear_forward()
+        if self.static_buffer is not None:
+            self.static_buffer.next_index = 0
+            self.static_buffer.staged_tokens = None
+
+    def enable_static_buffer(self, capacity: int, device=None, pin_memory: bool = True) -> None:
+        """Read replayed routes from resident device rows (see StaticReplayBuffer)."""
+        self.static_buffer = StaticReplayBuffer(capacity, device=device, pin_memory=pin_memory)
+
+    def _build_host_stacks(self) -> list[torch.Tensor]:
+        lists = [replay.top_indices_list for replay in self.replays]
+        num_micro_batches = len(lists[0]) if lists else 0
+        if any(len(lst) != num_micro_batches for lst in lists):
+            raise AssertionError(
+                f"rank {_get_rank()}: replay layers recorded different micro batch counts "
+                f"{[len(lst) for lst in lists]}"
+            )
+        stacks = []
+        for i in range(num_micro_batches):
+            first = lists[0][i]
+            stack = torch.empty(
+                (len(lists), *first.shape), dtype=first.dtype, pin_memory=self.static_buffer.pin_memory
+            )
+            for slot, lst in enumerate(lists):
+                stack[slot].copy_(lst[i])
+            stacks.append(stack)
+        return stacks
+
+    def stage_static_micro_batch(self) -> None:
+        """Copy the next micro batch's routes of every layer into the device rows (one async copy)."""
+        buf = self.static_buffer
+        if buf.host_stacks is None:
+            buf.host_stacks = self._build_host_stacks()
+        if buf.next_index >= len(buf.host_stacks):
+            raise IndexError(
+                f"rank {_get_rank()}: static replay staging index {buf.next_index} out of range "
+                f"({len(buf.host_stacks)} recorded micro batches)"
+            )
+        host = buf.host_stacks[buf.next_index]
+        buf.next_index += 1
+        slots, num_tokens, topk = host.shape
+        if num_tokens > buf.capacity:
+            raise RuntimeError(
+                f"rank {_get_rank()}: micro batch has {num_tokens} routed rows, more than the static replay "
+                f"buffer capacity {buf.capacity}; raise the capacity (it is never reallocated, a captured "
+                f"CUDA graph keeps its address)"
+            )
+        if buf.device_rows is None:
+            device = torch.cuda.current_device() if buf.device is None else buf.device
+            buf.device_rows = torch.full((slots, buf.capacity, topk), -1, dtype=host.dtype, device=device)
+        elif buf.device_rows.shape[0] != slots or buf.device_rows.shape[2] != topk or buf.device_rows.dtype != host.dtype:
+            raise AssertionError(
+                f"rank {_get_rank()}: staged routes {tuple(host.shape)} {host.dtype} do not fit the static rows "
+                f"{tuple(buf.device_rows.shape)} {buf.device_rows.dtype}"
+            )
+        buf.device_rows[:, :num_tokens].copy_(host, non_blocking=True)
+        buf.staged_tokens = num_tokens
 
     def get_topk_fn(self, old_topk_fn, return_probs):
         manager = self
@@ -166,6 +271,13 @@ class BaseReplayManager:
                     top_indices = result
                 replay.record(top_indices)
                 return result
+
+            elif stage in ("replay_forward", "replay_backward") and manager.static_buffer is not None:
+                # Forward and backward recompute of one micro batch read the same staged rows.
+                return _get_replay_result(
+                    manager.static_buffer.rows(replay.static_slot, scores.shape[0]), scores, topk, *args,
+                    spread_padding_routes=getattr(replay, "spread_padding_routes", False), **kwargs,
+                )
 
             elif stage == "replay_forward":
                 return _get_replay_result(
@@ -298,3 +410,48 @@ def reject_router_fusion_with_routing_replay(*, router_fusion: bool, args) -> No
             "so the replayed routes would be skipped silently. Remove --moe-router-fusion or turn routing "
             "replay off."
         )
+
+
+def stage_static_replays() -> None:
+    """Before a forward: stage the next micro batch for every manager that replays from static rows.
+
+    Called by the Megatron forward steps (log-prob and train) right before the model call; a no-op
+    unless --routing-replay-static-buffer is on and the manager is in a replay stage."""
+    for m in all_replay_managers:
+        if m.enabled and m.static_buffer is not None and m.stage in ("replay_forward", "replay_backward"):
+            m.stage_static_micro_batch()
+
+
+def static_replay_capacity(args) -> int:
+    """Rows of the static replay buffer: the largest packed micro batch the train or log-prob pass can
+    build (max tokens per GPU and the largest THD bucket, rounded up to the pad size), or
+    --routing-replay-static-capacity when set."""
+    explicit = getattr(args, "routing_replay_static_capacity", None)
+    if explicit:
+        return int(explicit)
+    pad = getattr(args, "tensor_model_parallel_size", 1) * getattr(args, "data_pad_size_multiplier", 128)
+    biggest = max(
+        getattr(args, "max_tokens_per_gpu", None) or 0,
+        getattr(args, "log_probs_max_tokens_per_gpu", None) or 0,
+        max(getattr(args, "thd_bucket_sizes", None) or [0]),
+    )
+    if biggest <= 0:
+        raise ValueError("--routing-replay-static-buffer needs --max-tokens-per-gpu or --routing-replay-static-capacity")
+    return -(-biggest // pad) * pad
+
+
+def validate_static_replay_args(args) -> None:
+    """--routing-replay-static-buffer: one micro batch in flight between its forward and backward."""
+    if not getattr(args, "routing_replay_static_buffer", False):
+        return
+    if not (getattr(args, "use_routing_replay", False) or getattr(args, "use_rollout_routing_replay", False)):
+        raise ValueError("--routing-replay-static-buffer needs routing replay (--use-rollout-routing-replay)")
+    if getattr(args, "pipeline_model_parallel_size", 1) != 1 or getattr(args, "virtual_pipeline_model_parallel_size", None):
+        raise ValueError(
+            "--routing-replay-static-buffer needs pipeline parallel size 1: with pipelining several micro batches "
+            "are between their forward and backward, and they would share one set of static rows"
+        )
+    if getattr(args, "overlap_moe_expert_parallel_comm", False):
+        raise ValueError("--routing-replay-static-buffer does not support --overlap-moe-expert-parallel-comm")
+    if getattr(args, "qkv_format", "thd") != "thd":
+        raise ValueError("--routing-replay-static-buffer is only implemented for --qkv-format thd")
