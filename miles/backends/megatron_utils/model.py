@@ -30,6 +30,7 @@ from miles.backends.megatron_utils.ft.types import TrainStepOutcome
 from miles.backends.megatron_utils.local_weight_checksum import dump_local_weight_checksums
 from miles.backends.megatron_utils.optimizer_state_reset import reset_optimizer_states
 from miles.backends.training_utils.sampling_mask import get_rollout_sampling_masks
+from miles.backends.training_utils.thd_buckets import thd_bucket_kwargs
 from miles.backends.training_utils.weight_update.snapshot_publisher import SnapshotPublisher
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
 from miles.utils.audit_utils.witness.module import witness_dump_and_clear_stale
@@ -355,6 +356,7 @@ def forward_only(
             args.data_pad_size_multiplier,
             args.qkv_format,
             allgather_cp=args.allgather_cp,
+            **thd_bucket_kwargs(args),
         )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
@@ -500,6 +502,7 @@ def run_forward_backward_pass(
             args.data_pad_size_multiplier,
             args.qkv_format,
             allgather_cp=args.allgather_cp,
+            **thd_bucket_kwargs(args),
         )
 
         if "adapter_token_counts" in batch:

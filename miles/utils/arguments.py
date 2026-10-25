@@ -2659,6 +2659,19 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Multiplier for data padding size in data processing.",
             )
             parser.add_argument(
+                "--thd-bucket-sizes",
+                type=int,
+                nargs="+",
+                default=None,
+                help=(
+                    "THD without context parallelism: pad every packed micro batch to the smallest of these "
+                    "token counts that holds it (each a multiple of tp_size * --data-pad-size-multiplier), so "
+                    "Megatron local CUDA graphs see a fixed shape per bucket. With --thd-max-packed-sequences N "
+                    "the cu_seqlens list is also padded to N + 1 entries and max_seqlen is the bucket size. "
+                    "Unset (default): the old padding to the next multiple."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-sample-filter-path",
                 type=str,
                 default=None,
@@ -4086,6 +4099,7 @@ def miles_validate_args(args):
         args.use_routing_replay = True
     # moe_router_fusion is a Megatron flag (absent on the FSDP backend); the bridge path checks the provider again
     reject_router_fusion_with_routing_replay(router_fusion=getattr(args, "moe_router_fusion", False), args=args)
+    _validate_thd_bucket_sizes(args)
 
     args.rollout_external = _compute_rollout_external(args)
     args.custom_inference_engine_provider_path = _compute_custom_inference_engine_provider_path(args)
@@ -4358,3 +4372,17 @@ def hf_validate_args(args, hf_config):
 
     if len(errors) > 0:
         raise AssertionError("hf_validate_args failed: " + "; ".join(errors))
+
+
+def _validate_thd_bucket_sizes(args) -> None:
+    """--thd-bucket-sizes: sorted multiples of the pad size; only THD without context parallelism."""
+    from miles.backends.training_utils.thd_buckets import parse_bucket_sizes
+
+    if not getattr(args, "thd_bucket_sizes", None):
+        return
+    if getattr(args, "qkv_format", "thd") != "thd":
+        raise ValueError("--thd-bucket-sizes needs --qkv-format thd")
+    if getattr(args, "context_parallel_size", 1) != 1 or getattr(args, "allgather_cp", False):
+        raise ValueError("--thd-bucket-sizes is only implemented without context parallelism")
+    pad_size = getattr(args, "tensor_model_parallel_size", 1) * args.data_pad_size_multiplier
+    args.thd_bucket_sizes = parse_bucket_sizes(args.thd_bucket_sizes, pad_size)

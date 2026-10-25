@@ -2,6 +2,8 @@ from typing import Protocol
 
 import torch
 
+from miles.backends.training_utils.thd_buckets import bucket_target
+
 from .cp_utils import slice_with_cp
 from .parallel import get_parallel_state
 
@@ -54,6 +56,11 @@ def fill_replay_data(
 
     for iterator in data_iterator:
         iterator.reset()
+
+    # Bucket padding can add thousands of padding rows per micro batch; spread their dummy routes
+    # over all experts instead of sending every padding token to experts 0..topk-1.
+    for replay in replay_list:
+        replay.spread_padding_routes = bool(getattr(args, "thd_bucket_sizes", None))
 
     parallel_state = get_parallel_state()
     tp_rank = parallel_state.tp.rank
@@ -115,7 +122,10 @@ def fill_replay_data(
                         replay_data[i] = torch.where(r != -1, r + offset, r)
                         offset += r.shape[0]
                 replay_data = torch.cat(replay_data, dim=0)
-                pad = (pad_size - replay_data.size(0) % pad_size) % pad_size
+                # Same padded length as get_batch (THD buckets when set, else the next pad multiple).
+                buckets = getattr(args, "thd_bucket_sizes", None) if cp_size == 1 else None
+                target, _ = bucket_target(replay_data.size(0), buckets, pad_size)
+                pad = target - replay_data.size(0)
                 if pad != 0:
                     replay_data = pad_func(replay_data, pad)
 

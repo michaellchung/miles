@@ -37,6 +37,8 @@ class Replay:
         self.forward_index = 0
         self.backward_index = 0
         self.top_indices_list: list[torch.Tensor] = []
+        # True when micro batches are padded to THD buckets (set by fill_replay_data).
+        self.spread_padding_routes = False
 
     def record(self, top_indices: torch.Tensor):
         buf = torch.empty_like(top_indices, device="cpu", pin_memory=True)
@@ -68,6 +70,16 @@ class Replay:
 
     def clear_forward(self):
         self.forward_index = 0
+
+
+def _spread_padding_routes(top_indices: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Routes for padding rows that spread them evenly over all experts: row r takes experts
+    (r * topk + j) % num_experts, j < topk (distinct within a row when topk <= num_experts).
+    Computed for every row without a data-dependent branch (no host sync, CUDA-graph safe)."""
+    rows, topk = top_indices.shape
+    row = torch.arange(rows, device=top_indices.device, dtype=top_indices.dtype).unsqueeze(-1)
+    col = torch.arange(topk, device=top_indices.device, dtype=top_indices.dtype).unsqueeze(0)
+    return (row * topk + col) % num_experts
 
 
 class BaseReplayManager:
@@ -107,7 +119,7 @@ class BaseReplayManager:
     def get_topk_fn(self, old_topk_fn, return_probs):
         manager = self
 
-        def _get_replay_result(top_indices, scores, topk, *args, **kwargs):
+        def _get_replay_result(top_indices, scores, topk, *args, spread_padding_routes=False, **kwargs):
             assert (
                 top_indices.shape[0] == scores.shape[0]
             ), f"rank {_get_rank()}: replay n_tokens {top_indices.shape[0]} does not match scores n_tokens {scores.shape[0]}"
@@ -121,9 +133,14 @@ class BaseReplayManager:
 
             # fill padding tokens with arange to avoid invalid reading; the sync-free path
             # fills unconditionally (a no-op for rows with a valid pick) instead of reading
-            # all_invalid.any() on the host
+            # all_invalid.any() on the host.  With THD buckets the (possibly many) padding
+            # rows are spread over all experts instead (also without a host read).
             all_invalid = (top_indices == -1).all(dim=-1)
-            if sync_free.enabled() or all_invalid.any():
+            if spread_padding_routes:
+                top_indices = torch.where(
+                    all_invalid.unsqueeze(-1), _spread_padding_routes(top_indices, scores.shape[1]), top_indices
+                )
+            elif sync_free.enabled() or all_invalid.any():
                 top_indices = fill_all_invalid_rows(top_indices, all_invalid, scores.shape[1])
 
             if return_probs:
@@ -151,10 +168,16 @@ class BaseReplayManager:
                 return result
 
             elif stage == "replay_forward":
-                return _get_replay_result(replay.pop_forward(), scores, topk, *args, **kwargs)
+                return _get_replay_result(
+                    replay.pop_forward(), scores, topk, *args,
+                    spread_padding_routes=getattr(replay, "spread_padding_routes", False), **kwargs,
+                )
 
             elif stage == "replay_backward":
-                return _get_replay_result(replay.pop_backward(), scores, topk, *args, **kwargs)
+                return _get_replay_result(
+                    replay.pop_backward(), scores, topk, *args,
+                    spread_padding_routes=getattr(replay, "spread_padding_routes", False), **kwargs,
+                )
 
             else:
                 return old_topk_fn(scores, topk, *args, **kwargs)
