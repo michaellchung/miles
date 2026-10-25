@@ -82,6 +82,7 @@ def apply_bridge_moe_runtime_args(provider, args) -> None:
     ``--cuda-graph-impl``, and for router fusion together with routing replay.
     """
     _reject_bridge_cuda_graphs(cuda_graph_impl=getattr(args, "cuda_graph_impl", "none"))
+    apply_bridge_local_cuda_graph_args(provider, args)
     for name, value in bridge_moe_runtime_overrides(args).items():
         if not hasattr(provider, name):
             raise AttributeError(
@@ -106,13 +107,45 @@ def describe_bridge_moe_runtime_config(provider, args) -> str:
     )
 
 
+# CUDA graph settings copied onto a bridge provider for --cuda-graph-impl local (provider field <- args attr).
+BRIDGE_LOCAL_CUDA_GRAPH_FIELDS = MappingProxyType(
+    {
+        "cuda_graph_impl": "cuda_graph_impl",
+        "cuda_graph_modules": "cuda_graph_modules",
+        "cuda_graph_warmup_steps": "cuda_graph_warmup_steps",
+        "use_te_rng_tracker": "te_rng_tracker",
+    }
+)
+
+
+def apply_bridge_local_cuda_graph_args(provider, args) -> None:
+    """--cuda-graph-impl local in bridge mode: copy the CUDA graph settings onto the provider and install
+    the eager fallback for unmatched graph inputs (megatron_utils/cuda_graph_fallback.py).
+
+    Megatron captures local graphs in its own schedule (``create_cudagraphs()`` at the end of the first
+    training forward/backward), so Miles' training loop needs no capture call. The RNG tracker must be
+    TE's (Megatron enables ``--te-rng-tracker`` for CUDA graphs with the TE transformer impl)."""
+    if getattr(args, "cuda_graph_impl", "none") != "local":
+        return
+    if not getattr(args, "te_rng_tracker", False):
+        raise ValueError("--cuda-graph-impl local needs --te-rng-tracker (the CUDA-graph-safe RNG tracker)")
+    for field, attr in BRIDGE_LOCAL_CUDA_GRAPH_FIELDS.items():
+        if not hasattr(provider, field):
+            raise AttributeError(f"bridge provider {type(provider).__name__} has no field {field!r}")
+        setattr(provider, field, getattr(args, attr))
+    from miles.backends.megatron_utils import cuda_graph_fallback
+
+    cuda_graph_fallback.install()
+
+
 def _reject_bridge_cuda_graphs(*, cuda_graph_impl) -> None:
-    # The bridge copy does not carry the CUDA graph settings (modules, warmup, RNG tracker, ...), and
-    # copying the impl alone would capture graphs with the provider's defaults for the rest. Fail
-    # instead of training without graphs while args claim otherwise.
-    if cuda_graph_impl not in (None, "none"):
+    # Only the local impl is wired (apply_bridge_local_cuda_graph_args): Megatron captures it inside
+    # its schedule. The transformer_engine impl needs TECudaGraphHelper calls in the training loop,
+    # which Miles does not make, and full_iteration wraps Megatron's own training loop. Fail instead
+    # of training without graphs while args claim otherwise.
+    if cuda_graph_impl not in (None, "none", "local"):
         raise ValueError(
-            f"--cuda-graph-impl {cuda_graph_impl} is not supported with --megatron-to-hf-mode bridge: the "
-            "bridge provider does not receive the CUDA graph settings, so the flag would have no effect. "
-            "Remove it, or build the model with --custom-model-provider-path."
+            f"--cuda-graph-impl {cuda_graph_impl} is not supported with --megatron-to-hf-mode bridge: Miles' "
+            "training loop does not capture transformer_engine / full_iteration graphs. Use "
+            "--cuda-graph-impl local, or build the model with --custom-model-provider-path."
         )

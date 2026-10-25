@@ -12,6 +12,7 @@ from miles.utils.ft_utils.process_group_utils import GeneralPGUtil
 from miles.utils.object_store import ObjectStoreGetResult
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from miles.utils.types import RolloutBatch
+from miles.backends.training_utils.thd_buckets import bucket_target, pad_cu_seqlens
 
 from ...utils.data import process_rollout_data
 from ...utils.ray_utils import Box
@@ -174,9 +175,15 @@ def get_batch(
     qkv_format: str = "thd",
     get_position_ids: bool = False,
     allgather_cp: bool = False,
+    thd_bucket_sizes: Sequence[int] | None = None,
+    thd_max_cu_entries: int | None = None,
 ) -> dict[str, torch.Tensor | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
+
+    ``thd_bucket_sizes`` / ``thd_max_cu_entries`` (THD without CP only): pad the packed stream to the
+    smallest bucket that holds it and ``cu_seqlens`` to a fixed entry count, so a captured CUDA graph
+    sees the same signature for every micro batch of a bucket (see ``thd_buckets.py``).
 
     Steps:
     - Fetch raw fields via iterator.
@@ -222,6 +229,7 @@ def get_batch(
     pad_token_id = 0
     pad_size = parallel_state.tp.size * pad_multiplier
     pad = 0
+    bucket_max_seqlen = None  # set by the THD bucket path
 
     # for cp, we need all tokens to calculate logprob
     batch["unconcat_tokens"] = tokens
@@ -278,16 +286,26 @@ def get_batch(
 
             tokens = torch.cat(tokens)
 
-            # Always pad to reduce memory fragmentation and maybe make the computation faster
-            pad = (pad_size - tokens.size(0) % pad_size) % pad_size
+            # Always pad to reduce memory fragmentation and maybe make the computation faster.
+            # With buckets (CP 1 only): pad to the bucket and fix the cu_seqlens entry count.
+            buckets = thd_bucket_sizes if cp_size == 1 else None
+            target, in_bucket = bucket_target(tokens.size(0), buckets, pad_size)
+            pad = target - tokens.size(0)
             if pad != 0:
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
-                cu_seqlens.append(cu_seqlens[-1] + pad)
+            cu_seqlens, fixed_entries = pad_cu_seqlens(
+                cu_seqlens, target, thd_max_cu_entries if in_bucket else None
+            )
+            bucket_max_seqlen = target if (in_bucket and fixed_entries) else None
 
             # thd requires the cu_seqlens to be of the origin length
             cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int).cuda() * cp_size
 
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        if qkv_format == "thd" and not allgather_cp and bucket_max_seqlen is not None:
+            # A fixed value per bucket: the graph signature compares max_seqlen by value.
+            max_seqlen = bucket_max_seqlen
+        else:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
         tokens = tokens.unsqueeze(0)
 

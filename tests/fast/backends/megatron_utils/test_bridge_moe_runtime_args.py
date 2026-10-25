@@ -47,6 +47,9 @@ class _NemotronHProvider:
     overlap_moe_expert_parallel_comm: bool = False
     delay_wgrad_compute: bool = False
     cuda_graph_impl: str = "none"
+    cuda_graph_modules: object = "full"
+    cuda_graph_warmup_steps: int = 3
+    use_te_rng_tracker: bool = False
     mtp_num_layers: int | None = None
     mtp_detach_heads: bool = False
 
@@ -204,10 +207,44 @@ def test_a_provider_that_fuses_the_router_is_rejected_under_replay(apply_bridge_
         apply_bridge_runtime_config(_NemotronHProvider(moe_router_fusion=True), _megatron_args())
 
 
-@pytest.mark.parametrize("impl", ["local", "transformer_engine", "full_iteration"])
+@pytest.mark.parametrize("impl", ["transformer_engine", "full_iteration"])
 def test_cuda_graphs_are_rejected_in_bridge_mode(apply_bridge_runtime_config: Callable, impl: str) -> None:
     with pytest.raises(ValueError, match=f"--cuda-graph-impl {impl} is not supported"):
         apply_bridge_runtime_config(_NemotronHProvider(), _megatron_args(cuda_graph_impl=impl))
+
+
+def test_local_cuda_graphs_copy_their_settings_onto_the_provider(
+    apply_bridge_runtime_config: Callable, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--cuda-graph-impl local: impl, modules, warmup and the TE RNG tracker reach the provider, and the
+    eager fallback for unmatched graph inputs is installed (stubbed here: no Megatron on CPU CI)."""
+    from miles.backends.megatron_utils import cuda_graph_fallback
+
+    installed = []
+    monkeypatch.setattr(cuda_graph_fallback, "install", lambda: installed.append(True) or True)
+    provider = _NemotronHProvider()
+    args = _megatron_args(
+        cuda_graph_impl="local", cuda_graph_modules=["mamba", "attn"], cuda_graph_warmup_steps=2, te_rng_tracker=True
+    )
+
+    apply_bridge_runtime_config(provider, args)
+
+    assert provider.cuda_graph_impl == "local"
+    assert provider.cuda_graph_modules == ["mamba", "attn"]
+    assert provider.cuda_graph_warmup_steps == 2
+    assert provider.use_te_rng_tracker is True
+    assert installed == [True]
+    # the MoE settings of the island run are unchanged
+    assert provider.moe_token_dispatcher_type == "flex"
+    assert provider.moe_flex_dispatcher_backend == "deepep"
+
+
+def test_local_cuda_graphs_need_the_te_rng_tracker(apply_bridge_runtime_config: Callable) -> None:
+    args = _megatron_args(
+        cuda_graph_impl="local", cuda_graph_modules=["mamba"], cuda_graph_warmup_steps=3, te_rng_tracker=False
+    )
+    with pytest.raises(ValueError, match="needs --te-rng-tracker"):
+        apply_bridge_runtime_config(_NemotronHProvider(), args)
 
 
 def test_the_log_line_names_the_effective_values_and_the_copied_flags() -> None:
