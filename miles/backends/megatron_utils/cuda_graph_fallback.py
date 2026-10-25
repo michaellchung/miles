@@ -101,3 +101,68 @@ def install() -> bool:
     _INSTALLED = True
     logger.info("cuda_graph_fallback: eager fallback for unmatched local CUDA graph inputs installed")
     return True
+
+
+# --- MoE recompute with mamba/attn-only local graphs -------------------------------------------------------
+#
+# Megatron (a84b10547) turns MoELayer's own "moe" recompute off whenever cuda_graph_impl == "local"
+# (moe_layer.py: ``and config.cuda_graph_impl != 'local'``), expecting MoETransformerLayer to recompute.
+# MoETransformerLayer only does that in its partial-graph mode (cuda_graph_modules with moe_router /
+# moe_preprocess). With graphs for mamba / attn only, the MoE layers run eagerly and nobody recomputes them:
+# every MoE layer keeps its permuted tokens, fc1 output, activation and shared-expert activations for the
+# backward. G-DG measured about 19.6 GiB of such tensors per micro batch on one rank (8192 tokens, Nemotron-3
+# Nano), the main part of the extra memory of the local graphs (SESSION27/CUDA-GRAPH.md section 10).
+# This patch turns the MoE layer's normal recompute back on when the MoE layers are outside every graph.
+
+_MOE_RECOMPUTE_GUARD = "and config.cuda_graph_impl != 'local'"
+MOE_RECOMPUTE_STATS = {"moe_layers_recompute_restored": 0}
+_MOE_PATCHED = False
+
+
+def _module_names(modules) -> list[str]:
+    return [getattr(m, "name", str(m)) for m in (modules or [])]
+
+
+def moe_runs_outside_graphs(config) -> bool:
+    """Local graphs are on, but no captured scope contains a MoE layer (so MoE layers run eagerly)."""
+    if getattr(config, "cuda_graph_impl", "none") != "local":
+        return False
+    names = _module_names(getattr(config, "cuda_graph_modules", None))
+    return bool(names) and not any(n in ("moe", "moe_router", "moe_preprocess") for n in names)
+
+
+def install_moe_recompute_for_eager_moe() -> bool:
+    """Patch ``MoELayer.__init__`` once so that "moe" selective recompute stays on when the MoE layers run
+    outside the local graphs. Only installed when the a84b10547 guard line is in the MoELayer source."""
+    global _MOE_PATCHED
+    if _MOE_PATCHED:
+        return True
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
+    try:
+        src = inspect.getsource(MoELayer.__init__)
+    except (OSError, TypeError):
+        src = ""
+    if _MOE_RECOMPUTE_GUARD not in src:
+        logger.warning(
+            "cuda_graph_fallback: MoELayer.__init__ has no %r line; not patching the MoE recompute",
+            _MOE_RECOMPUTE_GUARD,
+        )
+        return False
+    orig_init = MoELayer.__init__
+
+    def __init__(self, config, *args, **kwargs):
+        orig_init(self, config, *args, **kwargs)
+        wanted = config.recompute_granularity == "selective" and "moe" in (config.recompute_modules or [])
+        if wanted and not self.moe_layer_recompute and moe_runs_outside_graphs(config):
+            self.moe_layer_recompute = True
+            MOE_RECOMPUTE_STATS["moe_layers_recompute_restored"] += 1
+            if MOE_RECOMPUTE_STATS["moe_layers_recompute_restored"] == 1:
+                logger.info(
+                    "cuda_graph_fallback: MoE layers run outside the local graphs (modules %s); keeping their "
+                    "'moe' recompute on", _module_names(config.cuda_graph_modules)
+                )
+
+    MoELayer.__init__ = __init__
+    _MOE_PATCHED = True
+    return True

@@ -137,6 +137,7 @@ def apply_bridge_local_cuda_graph_args(provider, args) -> None:
     from miles.backends.megatron_utils import cuda_graph_fallback
 
     cuda_graph_fallback.install()
+    cuda_graph_fallback.install_moe_recompute_for_eager_moe()
 
 
 def _reject_router_graph_without_static_replay(args) -> None:

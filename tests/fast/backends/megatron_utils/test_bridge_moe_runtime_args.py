@@ -222,6 +222,7 @@ def test_local_cuda_graphs_copy_their_settings_onto_the_provider(
 
     installed = []
     monkeypatch.setattr(cuda_graph_fallback, "install", lambda: installed.append(True) or True)
+    monkeypatch.setattr(cuda_graph_fallback, "install_moe_recompute_for_eager_moe", lambda: installed.append("moe") or True)
     provider = _NemotronHProvider()
     args = _megatron_args(
         cuda_graph_impl="local", cuda_graph_modules=["mamba", "attn"], cuda_graph_warmup_steps=2, te_rng_tracker=True
@@ -233,7 +234,7 @@ def test_local_cuda_graphs_copy_their_settings_onto_the_provider(
     assert provider.cuda_graph_modules == ["mamba", "attn"]
     assert provider.cuda_graph_warmup_steps == 2
     assert provider.use_te_rng_tracker is True
-    assert installed == [True]
+    assert installed == [True, "moe"]
     # the MoE settings of the island run are unchanged
     assert provider.moe_token_dispatcher_type == "flex"
     assert provider.moe_flex_dispatcher_backend == "deepep"
@@ -255,6 +256,7 @@ def test_router_graphs_under_replay_need_the_static_replay_buffer(
     from miles.backends.megatron_utils import cuda_graph_fallback
 
     monkeypatch.setattr(cuda_graph_fallback, "install", lambda: True)
+    monkeypatch.setattr(cuda_graph_fallback, "install_moe_recompute_for_eager_moe", lambda: True)
     common = dict(cuda_graph_impl="local", cuda_graph_modules=modules, cuda_graph_warmup_steps=3, te_rng_tracker=True)
     with pytest.raises(ValueError, match="routing-replay-static-buffer"):
         apply_bridge_runtime_config(
@@ -276,6 +278,7 @@ def test_mamba_and_attention_graphs_need_no_static_replay_buffer(
     from miles.backends.megatron_utils import cuda_graph_fallback
 
     monkeypatch.setattr(cuda_graph_fallback, "install", lambda: True)
+    monkeypatch.setattr(cuda_graph_fallback, "install_moe_recompute_for_eager_moe", lambda: True)
     args = _megatron_args(
         cuda_graph_impl="local", cuda_graph_modules=["mamba", "attn"], cuda_graph_warmup_steps=3,
         te_rng_tracker=True, use_rollout_routing_replay=True, use_routing_replay=True,
