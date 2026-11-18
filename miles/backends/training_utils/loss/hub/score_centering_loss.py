@@ -5,9 +5,10 @@ from collections.abc import Callable
 
 import torch
 
+from miles.backends.training_utils.data import rollout_topk_prep
 from miles.backends.training_utils.data.sampling_mask import rollout_topk_candidate_ids
 from miles.backends.training_utils.loss.hub.math_utils import compute_approx_kl
-from miles.backends.training_utils.loss.hub.response_layout import response_layout
+from miles.backends.training_utils.loss.hub.response_layout import PackedSlices, response_layout
 from miles.backends.training_utils.loss.hub.score_centering import (
     ScoreCenteringInputs,
     score_centering_loss,
@@ -18,11 +19,12 @@ from miles.utils.types import RolloutBatch
 
 
 def score_candidates(
-    args: Namespace, logits: torch.Tensor, ids: torch.Tensor, *, chunk_size: int
+    args: Namespace, logits: torch.Tensor, ids: torch.Tensor, *, chunk_size: int, validate_ids: bool = True
 ) -> dict[str, torch.Tensor]:
     """Score ``ids`` ``[N, 1 + K]`` (sampled token, then rollout candidates) against ``logits`` ``[N, V/TP]``.
 
     Returns ``selected`` ``[N, 1 + K]``, plus ``entropy`` and ``kl_log_probs`` ``[N]`` when the args need them.
+    ``validate_ids=False`` skips the device range check of ``ids`` (a host wait) for ids checked already.
     """
     parallel = get_parallel_state()
     with_entropy = args.entropy_coef != 0 or args.observe_training_entropy
@@ -37,6 +39,7 @@ def score_candidates(
         chunk_size=chunk_size,
         with_entropy=with_entropy and (not replay or support_only),
         sampling_support=support_only,
+        validate_ids=validate_ids,
     )
     result = {}
     if args.use_kl_loss:
@@ -111,6 +114,9 @@ def score_centering_loss_function(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Score centering on the microbatch's `ResponseLayout`: packed responses, or padded rows."""
     layout = response_layout(args, batch, logits, sum_of_sample_mean)
+    prefetched = batch.get(rollout_topk_prep.PREFETCHED)
+    if prefetched is not None and isinstance(layout, PackedSlices):
+        return _score_centering_on_prefetched_rows(args, batch, logits, layout, prefetched)
 
     def candidates(sample: int, positions: torch.Tensor) -> torch.Tensor:
         return rollout_topk_candidate_ids(batch, sample, positions)
@@ -130,6 +136,33 @@ def score_centering_loss_function(
         advantages=layout.rows(batch["advantages"]),
         candidate_ids=layout.rows_at_positions(candidates, fill=-1),
         rollout_head_log_probs=layout.rows_at_positions(head_log_probs),
+        ref_log_probs=layout.rows(batch["ref_log_probs"]) if args.use_kl_loss else None,
+        reduce=layout.sum_of_sample_mean,
+    )
+
+
+def _score_centering_on_prefetched_rows(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    layout: PackedSlices,
+    prefetched: rollout_topk_prep.PrefetchedRows,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """`score_centering_loss_function` on the top-k rows `MILES_SC_TOPK_PREP` laid out and range-checked ahead."""
+    candidate_rows, head_rows = prefetched.rows()
+
+    def score(chunk: torch.Tensor, tokens: torch.Tensor, candidate_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+        ids = torch.cat((tokens.unsqueeze(-1), candidate_ids.to(tokens.dtype)), dim=-1)
+        return score_candidates(args, chunk, ids, chunk_size=layout.chunk_size, validate_ids=False)
+
+    return score_centering_objective(
+        args,
+        scored=layout.map_logit_rows(logits, score, side_rows=candidate_rows),
+        active=layout.loss_masks().bool(),
+        rollout_log_probs=layout.rows(batch["rollout_log_probs"]),
+        advantages=layout.rows(batch["advantages"]),
+        candidate_ids=layout.rows(candidate_rows),
+        rollout_head_log_probs=layout.rows(head_rows),
         ref_log_probs=layout.rows(batch["ref_log_probs"]) if args.use_kl_loss else None,
         reduce=layout.sum_of_sample_mean,
     )

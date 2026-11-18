@@ -123,12 +123,20 @@ class ResponseLayout(Protocol):
         """Log-probs (and entropy) of the response tokens, on the rows."""
 
     def map_logit_rows(
-        self, logits: torch.Tensor, fn: RowFn, side: SideFn | None = None, *, side_fill: float = 0
+        self,
+        logits: torch.Tensor,
+        fn: RowFn,
+        side: SideFn | None = None,
+        *,
+        side_fill: float = 0,
+        side_rows: Sequence[torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """`fn(logits, targets, side rows)` over the response rows; results on the rows.
 
         `PackedSlices` calls it once per response, `PaddedRows` once on all rows (`chunk_size` bounds the
         work `fn` does at a time). `side_fill` fills the side input of rows outside any response.
+        `side_rows` (`PackedSlices` only) is the side input already on this rank's rows of each sample, in
+        place of `side`.
         """
 
     def sum_of_sample_mean(self, x: torch.Tensor) -> torch.Tensor:
@@ -257,7 +265,8 @@ class PackedSlices:
         entropy = torch.cat(result["entropy"], dim=0) if with_entropy else None
         return torch.cat(result["log_probs"], dim=0), entropy
 
-    def map_logit_rows(self, logits, fn, side=None, *, side_fill=0):
+    def map_logit_rows(self, logits, fn, side=None, *, side_fill=0, side_rows=None):
+        assert side is None or side_rows is None, "pass the side input as a function or as rows, not both"
         args, batch = self.args, self.batch
         results: dict[str, list[torch.Tensor]] = {}
         chunks = _iter_response_chunks(
@@ -270,7 +279,12 @@ class PackedSlices:
             include_response_indices=side is not None,
         )
         for i, (chunk, tokens, positions) in enumerate(chunks):
-            extra = None if side is None else side(i, torch.as_tensor(list(positions), dtype=torch.long))
+            if side_rows is not None:
+                extra = side_rows[i]
+                if extra.size(0) != chunk.size(0):
+                    raise ValueError(f"sample {i}: {extra.size(0)} side rows for {chunk.size(0)} response rows")
+            else:
+                extra = None if side is None else side(i, torch.as_tensor(list(positions), dtype=torch.long))
             for key, value in fn(chunk, tokens, None if extra is None else extra.to(logits.device)).items():
                 results.setdefault(key, []).append(value)
         if args.allgather_cp and get_parallel_state().cp.size > 1:
@@ -433,7 +447,9 @@ class PaddedRows:
         )
         return log_probs.squeeze(-1), entropy
 
-    def map_logit_rows(self, logits, fn, side=None, *, side_fill=0):
+    def map_logit_rows(self, logits, fn, side=None, *, side_fill=0, side_rows=None):
+        if side_rows is not None:
+            raise NotImplementedError("PaddedRows lays the side input out itself; pass `side`")
         extra = None if side is None else self.rows_at_positions(side, fill=side_fill)
         return fn(logits.squeeze(0), self._targets, extra)
 

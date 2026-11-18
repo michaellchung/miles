@@ -1,3 +1,4 @@
+import os
 from argparse import Namespace
 from collections.abc import Iterator, Sequence
 
@@ -132,10 +133,32 @@ def _iter_response_chunks(
             yield logits_chunk, tokens_chunk, response_indices
         return
 
+    merge = os.environ.get(CP_RESPONSE_VIEW_ENV, "0") == "1"
     for row_ranges, tokens_chunk, response_indices in layout:
+        if merge:
+            row_ranges = _merge_adjacent_ranges(row_ranges)
         pieces = [logits[row_start:row_end] for row_start, row_end in row_ranges]
         logits_chunk = pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
         yield logits_chunk, tokens_chunk, response_indices
+
+
+# MILES_CP_RESPONSE_VIEW=1 (default off): a response whose zigzag halves sit next to each other in this
+# rank's rows (the usual case: the first half ends its chunk, the second starts the next) is one view of
+# the logits, not a copy of the two halves; its backward then fills one gradient buffer, not two.
+CP_RESPONSE_VIEW_ENV = "MILES_CP_RESPONSE_VIEW"
+
+
+def _merge_adjacent_ranges(row_ranges: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Half-open ``row_ranges`` with each range that starts where the previous ends joined to it; empty ones dropped."""
+    merged: list[tuple[int, int]] = []
+    for start, end in row_ranges:
+        if start == end:
+            continue
+        if merged and merged[-1][1] == start:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged or list(row_ranges[:1])
 
 
 def _value_support(args: Namespace, device: torch.device) -> torch.Tensor:

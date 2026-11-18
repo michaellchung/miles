@@ -6,7 +6,9 @@ tensor instead: the HF `weight_packed` bytes (two E2M1 codes per byte) followed 
 (one E8M0 exponent per 32 elements) along the last dim, 0.53125 B per parameter. `_get_weight_tensors()`
 dequantizes them, exactly, into BF16 weights that live only until the layer's backward under full recompute,
 so the resident experts cost a quarter of BF16 while the GEMMs stay BF16. The experts never train: there is
-no wgrad, and nothing on the trainer ever quantizes.
+no wgrad, and nothing on the trainer ever quantizes. ``MILES_K31_MXFP4_REDEQUANT_BACKWARD=1``
+(``mxfp4_redequant``) keeps the packed bytes instead of the BF16 copies for the backward, so a layer that is not
+recomputed does not hold its dequantized experts until its backward either.
 """
 
 import contextlib
@@ -17,7 +19,8 @@ from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedL
 
 from miles.backends.megatron_utils.megatron_config import has_hf_checkpoint
 from miles.utils.hf_utils.config import load_hf_config
-from miles.utils.mxfp4 import MXFP4_GROUP_SIZE, dequantize_mxfp4_rows, mxfp4_row_width
+from miles.utils.mxfp4 import MXFP4_GROUP_SIZE, mxfp4_row_width
+from miles_plugins.models.kimi_k3.mxfp4_redequant import RedequantFrozenExperts
 
 MXFP4_PACKED_FORMAT = "mxfp4-pack-quantized"
 _EXPERT_WEIGHT = re.compile(r"weight\d+")
@@ -44,8 +47,9 @@ def _keep_loaded_bytes(_tensor: torch.Tensor) -> None:
     """TE's init hook for the packed bytes: the checkpoint load fills them."""
 
 
-class _MXFP4FrozenExperts:
-    """Swap each BF16 expert weight for its packed bytes at registration; dequantize on every weight fetch."""
+class _MXFP4FrozenExperts(RedequantFrozenExperts):
+    """Swap each BF16 expert weight for its packed bytes at registration; dequantize on every weight fetch
+    (``RedequantFrozenExperts._get_weight_tensors``)."""
 
     def register_parameter(self, name, param, **kwargs):
         if param is not None and _EXPERT_WEIGHT.fullmatch(name) and param.dtype != torch.uint8:
@@ -83,15 +87,6 @@ class _MXFP4FrozenExperts:
         # checks every parameter's dtype against the input's
         with self._packed_weights_hidden():
             super().set_activation_dtype(inp)
-
-    def _get_weight_tensors(self):
-        return [
-            dequantize_mxfp4_rows(
-                getattr(self, f"weight{i}"),  # config-access-exempt: TE GroupedLinear registers weight0..weightN-1
-                MXFP4_GROUP_SIZE,
-            )
-            for i in range(self.num_gemms)
-        ]
 
 
 class MXFP4ColumnParallelGroupedLinear(_MXFP4FrozenExperts, TEColumnParallelGroupedLinear):

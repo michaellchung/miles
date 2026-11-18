@@ -37,7 +37,28 @@ from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, mak
 
 from miles.backends.megatron_utils.fp32_param_utils import mark_param_dtype
 from miles.backends.megatron_utils.megatron_to_hf.linear_attn_layout import LinearAttnHeads
-from miles_plugins.models.cp_utils import build_fla_cp_context, packed_shard_to_zigzag, zigzag_to_packed_shard
+from miles_plugins.models import fla_cp_block
+from miles_plugins.models.cp_utils import (
+    CORE_RELAYOUT_OVERLAP_ENV,
+    OUT_PROJ_RS_CHUNKS_ENV,
+    RELAYOUT_BWD_REDUCE_ENV,
+    SP_RELAYOUT_FUSED_ENV,
+    build_fla_cp_context,
+    core_relayout_overlap_on,
+    cp_relayout_a2a_on,
+    linear_reduce_scatter_chunked,
+    out_proj_rs_chunks,
+    out_proj_rs_chunks_apply,
+    packed_shard_to_zigzag,
+    packed_shard_to_zigzag_a2a,
+    packed_shard_to_zigzag_a2a_linear,
+    relayout_bwd_reduce_on,
+    sp_gather_zigzag_to_packed_shard,
+    sp_relayout_fused_on,
+    zigzag_to_packed_shard,
+    zigzag_to_packed_shard_a2a,
+    zigzag_to_packed_shard_tp_replicated,
+)
 
 try:
     from fla.modules import FusedRMSNormGated
@@ -85,6 +106,7 @@ def kda_kernel():
     if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
         os.environ.setdefault("FLA_TILELANG", "0")
     logger.info(f"KDA backward: FLA_TILELANG={os.environ.get('FLA_TILELANG', 'unset')}")
+    fla_cp_block.install()  # MILES_K31_KDA_FLA_CP_BLOCK (default off)
     return chunk_kda
 
 
@@ -112,10 +134,20 @@ def gdn_recurrence(q, k, v, beta_logits, decay, A_log, dt_bias, *, backend, cu_s
     return out
 
 
+def kda_keeps_intermediates() -> bool:
+    """MILES_K31_KDA_SAVE_INTERMEDIATES=1 (default off): fla's ``disable_recompute``. chunk_kda's backward
+    otherwise recomputes the gate cumsum, w/u/qg/kg and the inter-chunk state h from its inputs; under
+    Megatron's full recompute the layer's forward has just run, so keeping them trades about one layer's
+    intermediates (~3.6 GiB at 131k tokens x 12 heads) for that second recompute."""
+    return os.environ.get("MILES_K31_KDA_SAVE_INTERMEDIATES", "0") == "1"
+
+
 def kda_recurrence(q, k, v, beta_logits, decay, A_log, dt_bias, *, gate_lower_bound, cu_seqlens, cp_context):
     """q/k ``[b, s, H, hk]``, v ``[b, s, H, hv]``, decay ``[b, s, H * hv]`` (the low-rank forget gate,
     gated inside the kernel) -> ``[b, s, H, hv]``."""
     boundaries = {"cp_context": cp_context} if cp_context is not None else {"cu_seqlens": cu_seqlens}
+    if kda_keeps_intermediates() and torch.is_grad_enabled():
+        boundaries["disable_recompute"] = True
     out, _ = kda_kernel()(
         q=q,
         k=k,
@@ -492,6 +524,80 @@ class KimiDeltaAttention(LinearAttention):
         )
 
 
+_TP_SLICE_RELAYOUT_LOGGED = False
+_CP_RELAYOUT_A2A_LOGGED = False
+
+
+def _cp_relayout_a2a_on() -> bool:
+    """MILES_K31_KDA_CP_RELAYOUT_A2A=1 (default off): the zigzag relayouts move only the rows each rank needs."""
+    global _CP_RELAYOUT_A2A_LOGGED
+    on = cp_relayout_a2a_on()
+    if on and not _CP_RELAYOUT_A2A_LOGGED:
+        _CP_RELAYOUT_A2A_LOGGED = True
+        print("[k31] KDA CP relayout by all-to-all (needed rows only) on", flush=True)
+        if relayout_bwd_reduce_on():
+            # the all-to-all relayout (bit-identical) has its own backward; the TP-sum backward of
+            # _TPReplicatedRelayout (MILES_K31_KDA_RELAYOUT_BWD_REDUCE) only applies without it
+            print(f"[k31] {RELAYOUT_BWD_REDUCE_ENV}=1 ignored: the all-to-all relayout takes precedence", flush=True)
+    return on
+
+
+_SP_RELAYOUT_FUSED_LOGGED = False
+_CORE_RELAYOUT_OVERLAP_LOGGED = False
+
+
+def _sp_relayout_fused_on() -> bool:
+    """MILES_K31_KDA_SP_RELAYOUT_FUSED=1 (default off): the SP all-gather and the input relayout as one op whose
+    backward sums over TP before crossing CP (cp_utils). Applies under sequence parallelism with a zigzag CP
+    relayout; takes precedence over MILES_K31_KDA_CP_RELAYOUT_V2 / _A2A / MILES_K31_KDA_RELAYOUT_BWD_REDUCE for
+    the input (the output relayout still follows MILES_K31_KDA_CP_RELAYOUT_A2A)."""
+    global _SP_RELAYOUT_FUSED_LOGGED
+    on = sp_relayout_fused_on()
+    if on and not _SP_RELAYOUT_FUSED_LOGGED:
+        _SP_RELAYOUT_FUSED_LOGGED = True
+        print(f"[k31] {SP_RELAYOUT_FUSED_ENV}=1: KDA input SP gather + CP relayout fused", flush=True)
+    return on
+
+
+def _core_relayout_overlap_on() -> bool:
+    """MILES_K31_KDA_CORE_RELAYOUT_OVERLAP=1 (default off; needs MILES_K31_KDA_CP_RELAYOUT_A2A=1): the output
+    relayout and out_proj as one op whose backward overlaps the all-to-all with out_proj's weight gradient."""
+    global _CORE_RELAYOUT_OVERLAP_LOGGED
+    on = core_relayout_overlap_on()
+    if on and not _CORE_RELAYOUT_OVERLAP_LOGGED:
+        _CORE_RELAYOUT_OVERLAP_LOGGED = True
+        print(f"[k31] {CORE_RELAYOUT_OVERLAP_ENV}=1: KDA output relayout a2a overlaps out_proj wgrad", flush=True)
+    return on
+
+
+_OUT_PROJ_RS_CHUNKS_LOGGED = False
+
+
+def _out_proj_rs_chunks() -> int:
+    """MILES_K31_KDA_OUT_PROJ_RS_CHUNKS=n (default 1 = off): out_proj and its SP reduce-scatter pipelined over n
+    row chunks in the forward (cp_utils); the backward is the unchunked one."""
+    global _OUT_PROJ_RS_CHUNKS_LOGGED
+    chunks = out_proj_rs_chunks()
+    if chunks > 1 and not _OUT_PROJ_RS_CHUNKS_LOGGED:
+        _OUT_PROJ_RS_CHUNKS_LOGGED = True
+        print(
+            f"[k31] {OUT_PROJ_RS_CHUNKS_ENV}={chunks}: KDA out_proj + SP reduce-scatter in {chunks} chunks", flush=True
+        )
+    return chunks
+
+
+def _tp_slice_relayout_on(tp_group, rows: int) -> bool:
+    """MILES_K31_KDA_CP_RELAYOUT_V2=1 (default off): relayout the TP-replicated layer input by TP slices."""
+    global _TP_SLICE_RELAYOUT_LOGGED
+    on = os.environ.get("MILES_K31_KDA_CP_RELAYOUT_V2", "0") == "1" and tp_group.size() > 1
+    on = on and rows % tp_group.size() == 0
+    if on and not _TP_SLICE_RELAYOUT_LOGGED:
+        _TP_SLICE_RELAYOUT_LOGGED = True
+        if tp_group.rank() == 0:
+            print(f"[k31] KDA CP relayout v2 (TP slices) on tp={tp_group.size()}", flush=True)
+    return on
+
+
 class LinearAttentionLayer(MegatronModule):
     """``self_attention`` drop-in. ``allgather_cp``: the data pipeline already hands each CP rank a
     contiguous shard (``--allgather-cp``), so no zigzag relayout."""
@@ -515,10 +621,11 @@ class LinearAttentionLayer(MegatronModule):
         for param in self.input_layernorm.parameters():
             param.sequence_parallel = self.sequence_parallel
 
-    def _global_cu_seqlens(self, hidden_states, packed_seq_params):
+    def _global_cu_seqlens(self, hidden_states, packed_seq_params, rows: int | None = None):
+        """``rows``: this CP rank's zigzag-shard rows when ``hidden_states`` is only its SP slice."""
         if packed_seq_params is not None and packed_seq_params.cu_seqlens_q is not None:
             return packed_seq_params.cu_seqlens_q
-        total = hidden_states.shape[0] * self.cp_size
+        total = (hidden_states.shape[0] if rows is None else rows) * self.cp_size
         return torch.tensor([0, total], dtype=torch.int32, device=hidden_states.device)
 
     def forward(
@@ -537,14 +644,34 @@ class LinearAttentionLayer(MegatronModule):
         **kwargs,
     ) -> tuple[torch.Tensor, None]:
         x = self.input_layernorm(hidden_states)
-        if self.sequence_parallel:
+        relayout = self.cp_size > 1 and not self.allgather_cp
+        fused = relayout and self.sequence_parallel and _sp_relayout_fused_on()
+        if fused:
+            # SP gather + zigzag -> contiguous in one op: x is this rank's SP slice until it returns
+            global_cu_seqlens = self._global_cu_seqlens(x, packed_seq_params, rows=x.shape[0] * self.tp_group.size())
+        elif self.sequence_parallel:
             x = gather_from_sequence_parallel_region(x, tensor_parallel_output_grad=True, group=self.tp_group)
         else:
             x = copy_to_tensor_model_parallel_region(x, group=self.tp_group)
 
-        global_cu_seqlens = self._global_cu_seqlens(x, packed_seq_params)
-        relayout = self.cp_size > 1 and not self.allgather_cp
-        if relayout:
+        if not fused:
+            global_cu_seqlens = self._global_cu_seqlens(x, packed_seq_params)
+        by_a2a = relayout and _cp_relayout_a2a_on()
+        cp_rank = self.cp_group.rank() if relayout else None
+        if fused:
+            x = sp_gather_zigzag_to_packed_shard(x, global_cu_seqlens, self.cp_group, self.tp_group)
+        elif by_a2a:
+            # only the rows each rank needs, by all-to-all (TP slices of them when x is TP-replicated)
+            tp_slices = _tp_slice_relayout_on(self.tp_group, x.shape[0])
+            x = zigzag_to_packed_shard_a2a(
+                x, global_cu_seqlens, self.cp_group, cp_rank, self.cp_size, self.tp_group if tp_slices else None
+            )
+        elif relayout and _tp_slice_relayout_on(self.tp_group, x.shape[0]):
+            # x is the same on every TP rank: move 1 / TP of it over CP, rebuild the rest over TP
+            x = zigzag_to_packed_shard_tp_replicated(
+                x, global_cu_seqlens, self.cp_group, self.cp_group.rank(), self.cp_size, self.tp_group
+            )
+        elif relayout:
             x = zigzag_to_packed_shard(x, global_cu_seqlens, self.cp_group, self.cp_group.rank(), self.cp_size)
         cp_context = None
         cu_seqlens = global_cu_seqlens
@@ -556,9 +683,38 @@ class LinearAttentionLayer(MegatronModule):
 
         core = self.linear_attn(x.transpose(0, 1), cu_seqlens, cp_context).transpose(0, 1)
 
-        if relayout:
-            core = packed_shard_to_zigzag(core, global_cu_seqlens, self.cp_group, self.cp_group.rank(), self.cp_size)
-        output = self.linear_attn.out_proj(core)
+        out_proj = self.linear_attn.out_proj
+        chunks = _out_proj_rs_chunks() if self.sequence_parallel and out_proj.bias is None else 1
+        if out_proj_rs_chunks_apply(core.shape[0], self.tp_group.size(), chunks):
+            fold = by_a2a and _core_relayout_overlap_on()
+            if by_a2a and not fold:
+                core = packed_shard_to_zigzag_a2a(core, global_cu_seqlens, self.cp_group, cp_rank, self.cp_size)
+            elif relayout and not by_a2a:
+                core = packed_shard_to_zigzag(
+                    core, global_cu_seqlens, self.cp_group, self.cp_group.rank(), self.cp_size
+                )
+            # out_proj + the SP reduce-scatter (and the folded output relayout), forward pipelined over row chunks
+            output = linear_reduce_scatter_chunked(
+                core,
+                out_proj.weight,
+                self.tp_group,
+                chunks,
+                cp_group=self.cp_group,
+                relayout=(global_cu_seqlens, cp_rank, self.cp_size) if fold else None,
+            )
+            return output, None
+        if by_a2a and out_proj.bias is None and _core_relayout_overlap_on():
+            output = packed_shard_to_zigzag_a2a_linear(
+                core, out_proj.weight, global_cu_seqlens, self.cp_group, cp_rank, self.cp_size
+            )
+        else:
+            if by_a2a:
+                core = packed_shard_to_zigzag_a2a(core, global_cu_seqlens, self.cp_group, cp_rank, self.cp_size)
+            elif relayout:
+                core = packed_shard_to_zigzag(
+                    core, global_cu_seqlens, self.cp_group, self.cp_group.rank(), self.cp_size
+                )
+            output = out_proj(core)
         if self.sequence_parallel:
             output = reduce_scatter_to_sequence_parallel_region(output, group=self.tp_group)
         else:

@@ -16,7 +16,9 @@ class KimiK31Bridge(KimiK3Bridge):
     def _build_config(self):
         config = super()._build_config()
         # conversion only needs the parameter layout; training picks the backend from its args
-        configure_kimi_k31_dsa(config, self.text_config.dsa_config, topk_backend="torch")
+        configure_kimi_k31_dsa(
+            config, self.text_config.dsa_config, topk_backend="torch", kda_layers=config.kimi_kda_layers
+        )
         return config
 
     def _get_transformer_layer_spec(self, vp_stage=None):

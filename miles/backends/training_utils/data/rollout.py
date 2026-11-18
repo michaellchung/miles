@@ -8,6 +8,8 @@ import torch.nn.functional as F
 
 from miles.backends.training_utils.data.context_parallel import slice_log_prob_with_cp, slice_with_cp
 from miles.backends.training_utils.data.multimodal import expand_multimodal_rollout_data_in_place
+from miles.backends.training_utils.data.rollout_topk_prep import enabled as topk_prep_enabled
+from miles.backends.training_utils.data.rollout_topk_prep import prepare as prepare_rollout_topk
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.platforms import current_platform
 from miles.utils.audit_utils.witness.allocator import WitnessInfo
@@ -124,6 +126,8 @@ def get_rollout_data(
                     )
                 )
             ]
+    if topk_prep_enabled(args):
+        prepare_rollout_topk(args, rollout_data)
     if "rollout_routed_experts" in rollout_data:
         rollout_data["rollout_routed_experts"] = [torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]]
     if "rollout_indexer_topk" in rollout_data:

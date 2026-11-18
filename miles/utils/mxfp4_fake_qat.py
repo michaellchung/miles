@@ -30,6 +30,15 @@ arithmetic, so CPU and GPU agree), which makes the trainer weights equal the rel
 block 32, scale ``ceil_pow2(max(amax, 6 * 2**-126) / 6)``, ``rint`` ties to even), which is cheaper but
 whose bit equality with the codec is only checked by the CUDA tests.
 Signed zeros: a -0 parameter element re-encodes as +0 on both paths; values (and GEMM results) agree.
+
+``MILES_K31_MXFP4_QAT_NO_SYNC=1``: the on-grid test stays on the device. ``torch.equal`` is a host sync (16 per
+MoE layer and pass at EP16 with 128 trainable experts; in the a1d trace each one drains the stream and the next
+kernels start late). Instead the fetch writes ``where(all(rounded == data), data, rounded)``: the parameter's own
+bits when it is on the grid, the rounded tensor otherwise, exactly what the synced path leaves behind. The write
+goes through ``weight.data``, which does not bump the autograd version counter, so the unchanged on-grid write
+inside a pass does not invalidate saved tensors (the synced path's off-grid write, which only happens before the
+first forward after an optimizer step, did bump it). Costs one extra read and write of the trainable experts per
+fetch (~2 GB per MoE layer at EP16, ~0.3 ms) instead of 16 syncs.
 """
 
 from __future__ import annotations
@@ -49,6 +58,8 @@ _OTHER_FAKE_QAT_FLAGS = ("OPEN_TRAINING_NVFP4_FAKE_QAT_FLAG", "OPEN_TRAINING_INT
 # with the codec is checked only by the CUDA tests in tests/fast/utils/test_mxfp4_fake_qat.py.
 TRITON_KERNEL_FLAG = "MILES_MXFP4_QAT_TRITON"
 _INSTALLED = "_miles_mxfp4_qat_installed"
+# Opt-in: decide on the device whether to write the rounded weight back (no torch.equal host sync); same bits
+NO_SYNC_FLAG = "MILES_K31_MXFP4_QAT_NO_SYNC"
 
 
 def mxfp4_round_trip(weight: torch.Tensor) -> torch.Tensor:
@@ -78,13 +89,26 @@ def round_in_place_if_off_grid(weight: torch.Tensor) -> bool:
         return True
 
 
+def round_in_place_without_sync(weight: torch.Tensor) -> None:
+    """``round_in_place_if_off_grid`` without the host sync: the weight ends up with the same bits."""
+    with torch.no_grad():
+        data = weight.detach()
+        rounded = fake_quantize_mxfp4(data)
+        on_grid = (rounded == data).all()  # torch.equal for equal shapes and dtypes (NaN never equal, -0 == +0)
+        weight.data.copy_(torch.where(on_grid, data, rounded))
+
+
 def fake_quantize_mxfp4_weight_tensors(weight_tensors: Sequence[torch.Tensor]) -> Sequence[torch.Tensor]:
     """The grouped linear's expert weights, rounded onto the MXFP4 grid in place; same tensors returned."""
+    no_sync = os.getenv(NO_SYNC_FLAG, "0") == "1"
     for weight in weight_tensors:
         if hasattr(weight, "__fsdp_param__"):  # config-access-exempt: Megatron FSDP marks its weights so
             raise RuntimeError("MXFP4 fake QAT does not support Megatron FSDP weights.")
         assert weight.shape[-1] % MXFP4_GROUP_SIZE == 0, tuple(weight.shape)
-        round_in_place_if_off_grid(weight)
+        if no_sync:
+            round_in_place_without_sync(weight)
+        else:
+            round_in_place_if_off_grid(weight)
     return weight_tensors
 
 
@@ -145,5 +169,6 @@ __all__ = [
     "install_routed_expert_mxfp4_qat",
     "mxfp4_round_trip",
     "round_in_place_if_off_grid",
+    "round_in_place_without_sync",
     "validate_mxfp4_qat_config",
 ]

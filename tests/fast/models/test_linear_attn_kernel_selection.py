@@ -32,6 +32,36 @@ def test_kda_uses_the_triton_backward_on_blackwell_unless_set(monkeypatch, capab
     assert os.environ.get("FLA_TILELANG") == expected
 
 
+@pytest.mark.parametrize("flag,grad,expected", [(None, True, None), ("1", True, True), ("1", False, None)])
+def test_kda_save_intermediates_switch(monkeypatch, flag, grad, expected):
+    torch = pytest.importorskip("torch")
+    seen = {}
+
+    def fake_chunk_kda(**kwargs):
+        seen.update(kwargs)
+        return kwargs["v"], None
+
+    monkeypatch.setattr(linear_attn, "kda_kernel", lambda: fake_chunk_kda)
+    monkeypatch.delenv("MILES_K31_KDA_SAVE_INTERMEDIATES", raising=False)
+    if flag is not None:
+        monkeypatch.setenv("MILES_K31_KDA_SAVE_INTERMEDIATES", flag)
+    v = torch.zeros(1, 4, 2, 8)
+    with torch.set_grad_enabled(grad):
+        linear_attn.kda_recurrence(
+            v,
+            v,
+            v,
+            torch.zeros(1, 4, 2),
+            torch.zeros(1, 4, 16),
+            torch.zeros(2),
+            torch.zeros(16),
+            gate_lower_bound=-5.0,
+            cu_seqlens=None,
+            cp_context=None,
+        )
+    assert seen.get("disable_recompute") is expected
+
+
 def test_short_conv_backend_respects_fla_conv_backend(monkeypatch):
     monkeypatch.setenv("FLA_CONV_BACKEND", "cuda")
     assert linear_attn.short_conv_backend.__wrapped__() == "cuda"

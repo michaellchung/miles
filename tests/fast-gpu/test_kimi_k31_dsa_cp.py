@@ -19,6 +19,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.ci.ci_register import register_cuda_ci
 
+from miles_plugins.models.kimi_k3.kda_layout import KIMI_K3_KDA_LAYERS
 from miles_plugins.models.kimi_k3.model import configure_kimi_k3
 from miles_plugins.models.kimi_k31.model import KimiK31DSAAttention, configure_kimi_k31_dsa
 
@@ -60,8 +61,9 @@ def _config(cp: int) -> MLATransformerConfig:
         moe_latent_size=3584,
         context_parallel_size=cp,
     )
-    configure_kimi_k3(config)
-    configure_kimi_k31_dsa(config, DSA_CONFIG, topk_backend="torch")
+    kda_layers = tuple(n for n in KIMI_K3_KDA_LAYERS if n <= config.num_layers)
+    configure_kimi_k3(config, kda_layers)
+    configure_kimi_k31_dsa(config, DSA_CONFIG, topk_backend="torch", kda_layers=kda_layers)
     return config
 
 

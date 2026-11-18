@@ -5,9 +5,12 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
+from miles.utils.hf_utils.config import load_hf_config
 from miles.utils.lora.utils import is_lora_enabled
 
+from .kda_layout import kimi_k3_kda_layers
 from .layers import KimiK3Attention, KimiK3KDAAttention, KimiK3TransformerLayer
+from .moe_a2a_overlap import a2a_overlap_enabled, a2a_overlap_moe_spec
 from .mxfp4_experts import (
     MXFP4ColumnParallelGroupedLinear,
     MXFP4RowParallelGroupedLinear,
@@ -16,19 +19,15 @@ from .mxfp4_experts import (
 from .ops import situ_and_mul
 from .permute import load_slot_layout
 from .split_moe import partial_experts_spec
-
-KIMI_K3_KDA_LAYERS = tuple(
-    layer_number for layer_number in range(1, 94) if layer_number % 4 != 0 and layer_number != 93
-)
+from .stage_recompute import apply_stage_recompute
 
 
-def configure_kimi_k3(config) -> None:
+def configure_kimi_k3(config, kda_layers: tuple[int, ...]) -> None:
+    """``kda_layers``: ``kimi_k3_kda_layers`` of the checkpoint's text config."""
     assert config.num_layers <= 93
     assert config.num_attention_heads == 96
     assert config.moe_latent_size == 3584
-    config.kimi_kda_layers = tuple(
-        layer_number for layer_number in KIMI_K3_KDA_LAYERS if layer_number <= config.num_layers
-    )
+    config.kimi_kda_layers = tuple(kda_layers)
     config.kimi_linear_num_heads = 96
     config.kimi_linear_head_dim = 128
     config.kimi_linear_conv_kernel_size = 4
@@ -79,6 +78,9 @@ def build_kimi_k3_spec(
             experts = layer_spec.submodules.mlp.keywords["submodules"].experts.keywords["submodules"]
             experts.linear_fc1 = MXFP4ColumnParallelGroupedLinear
             experts.linear_fc2 = MXFP4RowParallelGroupedLinear
+        if config.moe_layer_freq[layer_offset + len(layer_specs)] and a2a_overlap_enabled():
+            # MILES_K3_MOE_A2A_OVERLAP: the EP all-to-alls overlap the shared experts and the expert dequant
+            layer_spec.submodules.mlp = a2a_overlap_moe_spec(layer_spec.submodules.mlp)
 
         layer_specs.append(layer_spec)
 
@@ -103,9 +105,11 @@ def frozen_experts_are_mxfp4(args) -> bool:
     return mxfp4
 
 
-def get_kimi_k3_spec(args, config, vp_stage, mla_attention=KimiK3Attention):
+def get_kimi_k3_spec(args, config, vp_stage, mla_attention=KimiK3Attention, text_config=None):
     _check_cp_layout(args)
-    configure_kimi_k3(config)
+    if text_config is None:
+        text_config = load_hf_config(args.hf_checkpoint).text_config
+    configure_kimi_k3(config, kimi_k3_kda_layers(text_config, config.num_layers))
     mxfp4 = frozen_experts_are_mxfp4(args)
     num_local_trainable = None
     if args.partial_experts_selection is not None:
@@ -117,16 +121,19 @@ def get_kimi_k3_spec(args, config, vp_stage, mla_attention=KimiK3Attention):
         )
         # every MoE layer has its own trainable set: the selection must name exactly the model's MoE layers
         moe_layers = [i for i, is_moe in enumerate(config.moe_layer_freq) if is_moe]
-        assert layout.moe_layers == moe_layers, (
-            f"--partial-experts-selection covers layers {layout.moe_layers}, the model's MoE layers are {moe_layers}"
-        )
+        assert (
+            layout.moe_layers == moe_layers
+        ), f"--partial-experts-selection covers layers {layout.moe_layers}, the model's MoE layers are {moe_layers}"
         # the mbridge loader reads the table from the model config; the converter and R3 read the active layout
         config.partial_experts_layout = layout
         num_local_trainable = layout.num_local_trainable
-    return build_kimi_k3_spec(
+    block_spec = build_kimi_k3_spec(
         config,
         vp_stage=vp_stage,
         mla_attention=mla_attention,
         mxfp4_experts=mxfp4,
         num_local_trainable_experts=num_local_trainable,
     )
+    # MILES_K31_RECOMPUTE_NUM_LAYERS_PER_STAGE: this stage's --recompute-method block layer count
+    apply_stage_recompute(config, stage_layers=len(block_spec.layer_specs))
+    return block_spec

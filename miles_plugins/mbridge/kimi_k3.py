@@ -8,6 +8,7 @@ from mbridge.core.safetensor_io import SafeTensorIO
 from mbridge.models import DeepseekV3Bridge
 from miles.utils.mxfp4 import MXFP4_GROUP_SIZE, dequantize_mxfp4_rows, pack_mxfp4_rows
 from miles_plugins.mbridge.linear_attn import LinearAttentionBridgeMixin
+from miles_plugins.models.kimi_k3.kda_layout import kimi_k3_kda_layers
 from miles_plugins.models.kimi_k3.model import build_kimi_k3_spec
 from miles_plugins.models.kimi_k3.ops import situ_and_mul
 from miles_plugins.models.kimi_k3.partial_experts import FROZEN_HALF, TRAINABLE_HALF, is_split_expert_param_name
@@ -203,7 +204,7 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
             moe_layer_freq=moe_layer_freq,
             disable_bf16_reduced_precision_matmul=True,
         )
-        config.kimi_kda_layers = tuple(hf_config.linear_attn_config["kda_layers"])
+        config.kimi_kda_layers = kimi_k3_kda_layers(hf_config, config.num_layers)
         config.kimi_linear_num_heads = hf_config.linear_attn_config["num_heads"]
         config.kimi_linear_head_dim = hf_config.linear_attn_config["head_dim"]
         config.kimi_linear_conv_kernel_size = hf_config.linear_attn_config["short_conv_kernel_size"]
@@ -260,7 +261,9 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
                 hf_layer = layer.layer_number - 1
                 assert hf_layer in layout.perm, f"selection has no entry for MoE layer {hf_layer}"
                 experts = layer.mlp.experts
-                trainable_half, frozen_half = getattr(experts, TRAINABLE_HALF), getattr(experts, FROZEN_HALF)  # config-access-exempt: the split module names its halves by these constants
+                trainable_half, frozen_half = getattr(experts, TRAINABLE_HALF), getattr(
+                    experts, FROZEN_HALF
+                )  # config-access-exempt: the split module names its halves by these constants
                 for local_slot in range(n_local):
                     original_id = layout.local_slot_to_original_id(hf_layer, ep_rank, local_slot)
                     fc1, fc2 = self._packed_expert_rows(hf_layer, original_id)
@@ -284,10 +287,20 @@ class KimiK3Bridge(LinearAttentionBridgeMixin, DeepseekV3Bridge):
 
     def _packed_expert_rows(self, hf_layer: int, expert_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         """fc1 (w1 stacked over w3) and fc2 (w2) of one HF expert as packed MXFP4 rows, as _weight_to_mcore_format builds them."""
-        fc1_names = [x.format(layer_number=hf_layer, expert_id=expert_id) for x in self._MXFP4_EXPERT_MAPPING["mlp.experts.linear_fc1.weight"]]
-        fc2_names = [x.format(layer_number=hf_layer, expert_id=expert_id) for x in self._MXFP4_EXPERT_MAPPING["mlp.experts.linear_fc2.weight"]]
-        fc1 = self._weight_to_mcore_format("mlp.experts.linear_fc1.weight", [self.safetensor_io.load_one_hf_weight(x) for x in fc1_names])
-        fc2 = self._weight_to_mcore_format("mlp.experts.linear_fc2.weight", [self.safetensor_io.load_one_hf_weight(x) for x in fc2_names])
+        fc1_names = [
+            x.format(layer_number=hf_layer, expert_id=expert_id)
+            for x in self._MXFP4_EXPERT_MAPPING["mlp.experts.linear_fc1.weight"]
+        ]
+        fc2_names = [
+            x.format(layer_number=hf_layer, expert_id=expert_id)
+            for x in self._MXFP4_EXPERT_MAPPING["mlp.experts.linear_fc2.weight"]
+        ]
+        fc1 = self._weight_to_mcore_format(
+            "mlp.experts.linear_fc1.weight", [self.safetensor_io.load_one_hf_weight(x) for x in fc1_names]
+        )
+        fc2 = self._weight_to_mcore_format(
+            "mlp.experts.linear_fc2.weight", [self.safetensor_io.load_one_hf_weight(x) for x in fc2_names]
+        )
         return fc1, fc2
 
     def _weight_name_mapping_mlp(self, name: str) -> list[str]:
@@ -355,8 +368,12 @@ def _expert_device(half) -> torch.device:
 
 
 def _copy_expert(half, local_index: int, fc1: torch.Tensor, fc2: torch.Tensor) -> None:
-    dst1 = getattr(half.linear_fc1, f"weight{local_index}")  # config-access-exempt: TE GroupedLinear registers weight0..weightN-1
-    dst2 = getattr(half.linear_fc2, f"weight{local_index}")  # config-access-exempt: TE GroupedLinear registers weight0..weightN-1
+    dst1 = getattr(
+        half.linear_fc1, f"weight{local_index}"
+    )  # config-access-exempt: TE GroupedLinear registers weight0..weightN-1
+    dst2 = getattr(
+        half.linear_fc2, f"weight{local_index}"
+    )  # config-access-exempt: TE GroupedLinear registers weight0..weightN-1
     assert dst1.shape == fc1.shape and dst1.dtype == fc1.dtype, (dst1.shape, dst1.dtype, fc1.shape, fc1.dtype)
     assert dst2.shape == fc2.shape and dst2.dtype == fc2.dtype, (dst2.shape, dst2.dtype, fc2.shape, fc2.dtype)
     dst1.copy_(fc1)

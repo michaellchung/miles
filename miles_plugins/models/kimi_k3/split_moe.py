@@ -42,6 +42,7 @@ from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, TEGroupe
 
 from miles_plugins.models.kimi_k3.mxfp4_experts import MXFP4ColumnParallelGroupedLinear, MXFP4RowParallelGroupedLinear
 from miles_plugins.models.kimi_k3.partial_experts import FROZEN_HALF, TRAINABLE_HALF
+from miles_plugins.models.kimi_k3.situ_probs_experts import SituProbsTEGroupedMLP, situ_probs_fused_enabled
 
 
 class PartiallyTrainableGroupedMLP(MegatronModule):
@@ -72,13 +73,14 @@ class PartiallyTrainableGroupedMLP(MegatronModule):
         assert not config.moe_pad_expert_input_to_capacity, "partial experts split tokens by tokens_per_expert counts"
         self.num_local_experts = num_local_experts
         self.num_local_trainable = num_local_trainable
-        self.trainable = TEGroupedMLP(
+        half_cls = SituProbsTEGroupedMLP if situ_probs_fused_enabled() else TEGroupedMLP
+        self.trainable = half_cls(
             num_local_trainable, config, submodules, pg_collection, name=_sub_name(name, TRAINABLE_HALF)
         )
         frozen_submodules = dataclasses.replace(
             submodules, linear_fc1=MXFP4ColumnParallelGroupedLinear, linear_fc2=MXFP4RowParallelGroupedLinear
         )
-        self.frozen = TEGroupedMLP(
+        self.frozen = half_cls(
             num_local_experts - num_local_trainable,
             config,
             frozen_submodules,

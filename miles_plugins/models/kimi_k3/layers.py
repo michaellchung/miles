@@ -1,4 +1,5 @@
 import copy
+import os
 
 import torch
 import torch.nn as nn
@@ -280,6 +281,16 @@ class KimiK3KDAAttention(LinearAttentionLayer):
         super().__init__(config, core, nn.Identity(), pg_collection, allgather_cp=False)
 
 
+def attn_res_bank_pad_rows() -> int:
+    """MILES_K3_ATTN_RES_BANK_PAD_ROWS (test only, default 0): zero rows the first layer adds to the snapshot
+    bank after its own reads, so every later layer carries them. Not inert: a zero row scores 0 in the bank
+    softmax and takes probability mass from the real rows (it adds nothing to the mix), so the loss differs
+    from the unpadded model's; use it to match memory and bandwidth, not numerics."""
+    rows = int(os.environ.get("MILES_K3_ATTN_RES_BANK_PAD_ROWS", "0"))
+    assert rows >= 0, rows
+    return rows
+
+
 class KimiK3TransformerLayer(TransformerLayer):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -290,6 +301,9 @@ class KimiK3TransformerLayer(TransformerLayer):
         device = torch.cuda.current_device()
         dtype = self.config.params_dtype
         self.attn_res_block_size = self.config.kimi_attn_res_block_size
+        # test-only: zero snapshot rows prepended to the bank, so a model cut from late layers (fewer blocks
+        # behind it) carries the bank rows, memory and traffic of the full model's layers it stands for
+        self.attn_res_bank_pad_rows = attn_res_bank_pad_rows()
         self.self_attention_res_norm = KimiRMSNorm(hidden_size, eps, device=device, dtype=dtype)
         self.self_attention_res_proj = nn.Linear(hidden_size, 1, bias=False, device=device, dtype=dtype)
         self.mlp_res_norm = KimiRMSNorm(hidden_size, eps, device=device, dtype=dtype)
@@ -349,7 +363,7 @@ class KimiK3TransformerLayer(TransformerLayer):
             prefix_sum, block_residual = unpack_stage_boundary(
                 hidden_states,
                 self.config.hidden_size,
-                bank_num_rows(layer_idx, self.attn_res_block_size),
+                bank_num_rows(layer_idx, self.attn_res_block_size) + self.attn_res_bank_pad_rows,
             )
 
         if block_residual.shape[-2] > 0:
@@ -395,6 +409,12 @@ class KimiK3TransformerLayer(TransformerLayer):
             mlp_kwargs["input_ids"] = input_ids
         mlp_output = self._add_bias(self.mlp(mlp_input, **mlp_kwargs))
         prefix_sum = prefix_sum + mlp_output
+        if layer_idx == 0 and self.attn_res_bank_pad_rows:
+            # after the first layer's own reads: every later layer sees the padded bank
+            pad = block_residual.new_zeros(
+                *block_residual.shape[:-2], self.attn_res_bank_pad_rows, block_residual.shape[-1]
+            )
+            block_residual = torch.cat((pad, block_residual), dim=-2)
 
         if self.layer_number == self.config.num_layers:
             prefix_sum = attn_res_aggregate(

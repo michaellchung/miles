@@ -17,16 +17,18 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
 import miles.backends.megatron_utils.runtime_patches  # noqa: F401  (DeepEP buffers stay out of torch_memory_saver)
+from miles.backends.megatron_utils.critic_head import critic_head_owner
+from miles.backends.training_utils.critic_freeze import freeze_attention_parameters
 from miles.backends.training_utils.model_companion import ModelCompanionInstallationUtils
+from miles.utils.args.configs.yeto_algo import yeto_algo_option
 from miles.utils.args.custom_view import compute_custom_function_config
 from miles.utils.args.runtime import TrainerConfig
 from miles.utils.audit_utils.witness.module import install_witness
+from miles.utils.chunk_sort_map import chunk_sort_map_enabled, install_chunk_sort_map
 from miles.utils.function_registry import load_function
 from miles.utils.megatron_bridge_utils import describe_bridge_moe_runtime_config, load_auto_bridge
 from miles.utils.replay_base import routing_replay_manager
-from miles.backends.training_utils.critic_freeze import freeze_attention_parameters
-from miles.backends.megatron_utils.critic_head import critic_head_owner
-from miles.utils.args.configs.yeto_algo import yeto_algo_option
+from miles.utils.router_gemm import ROUTER_GEMM_ENV, install_router_gemm, router_gemm_mode
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +134,7 @@ def _apply_bridge_runtime_config(provider, args: TrainerConfig) -> None:
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
 
+
 def _maybe_freeze_critic_attention(args: TrainerConfig, model: torch.nn.Module, role: str) -> None:
     if role != "critic" or not yeto_algo_option(args, "critic_freeze_attention"):
         return
@@ -143,6 +146,7 @@ def _value_head_output_size(args: TrainerConfig) -> int:
     if yeto_algo_option(args, "value_loss_type") == "classification":
         return args.value_num_bins
     return 1
+
 
 class LinearForLastLayer(torch.nn.Linear):
     def __init__(
@@ -383,6 +387,10 @@ def get_model_provider_func(
         _maybe_freeze_native_dsa_indexer(args, model)
         _maybe_freeze_for_partial_experts(args, model)
         _maybe_install_routed_expert_qat(args, model)
+        _maybe_install_router_gemm(model)
+        if chunk_sort_map_enabled():
+            # MILES_K31_CHUNK_SORT_MAP_TORCH: TE's chunk-sort row map as torch ops (miles.utils.chunk_sort_map)
+            install_chunk_sort_map()
 
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(
@@ -418,9 +426,9 @@ def _maybe_freeze_for_partial_experts(args: TrainerConfig, model: GPTModel) -> N
         return
     from miles_plugins.models.kimi_k3.partial_experts import freeze_all_but_trainable_experts
 
-    assert args.backend.moe_router_bias_update_rate == 0, (
-        "--partial-experts-selection keeps the router fixed; set --moe-router-bias-update-rate 0"
-    )
+    assert (
+        args.backend.moe_router_bias_update_rate == 0
+    ), "--partial-experts-selection keeps the router fixed; set --moe-router-bias-update-rate 0"
     trainable, frozen = freeze_all_but_trainable_experts(model)
     # the embedding freezes too: under full recompute the first pipeline stage's reentrant checkpoints would
     # see no input requiring grad and give its trainable experts no gradient (later stages receive a
@@ -430,7 +438,9 @@ def _maybe_freeze_for_partial_experts(args: TrainerConfig, model: GPTModel) -> N
     _require_grad_on_first_activation(model)
     has_experts = any(".mlp.experts." in name for name, _ in model.named_parameters())
     assert trainable > 0 or not has_experts, "--partial-experts-selection: no trainable expert parameter on this rank"
-    logger.info("partial experts: %d trainable expert parameters, %d frozen parameters on this rank", trainable, frozen)
+    logger.info(
+        "partial experts: %d trainable expert parameters, %d frozen parameters on this rank", trainable, frozen
+    )
 
 
 def _maybe_install_routed_expert_qat(args: TrainerConfig, model: torch.nn.Module) -> None:
@@ -447,6 +457,15 @@ def _maybe_install_routed_expert_qat(args: TrainerConfig, model: torch.nn.Module
     has_experts = any(".mlp.experts." in name for name, _ in model.named_parameters())
     assert count > 0 or not has_experts, "--routed-expert-qat: no trainable routed-expert grouped linear on this rank"
     logger.info("routed-expert MXFP4 QAT on %d grouped linears of this rank", count)
+
+
+def _maybe_install_router_gemm(model: torch.nn.Module) -> None:
+    """MILES_K31_ROUTER_GEMM=fp32|tf32|bf16: the MoE routers' gating GEMM precision (``miles.utils.router_gemm``)."""
+    mode = router_gemm_mode()
+    if mode is None:
+        return
+    count = install_router_gemm(model, mode)
+    logger.info("%s=%s on %d MoE routers of this rank", ROUTER_GEMM_ENV, mode, count)
 
 
 def _maybe_install_witness(

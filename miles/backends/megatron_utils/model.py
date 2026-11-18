@@ -27,6 +27,7 @@ from miles.backends.megatron_utils.ft.indep_dp import allreduce_grads_and_losses
 from miles.backends.megatron_utils.local_weight_checksum import dump_local_weight_checksums
 from miles.backends.megatron_utils.lora.native import wrap_model_provider_with_lora
 from miles.backends.megatron_utils.optimizer_state_reset import reset_optimizer_states
+from miles.backends.training_utils.data import rollout_topk_prep
 from miles.backends.training_utils.data.rollout import DataIterator, get_batch
 from miles.backends.training_utils.data.sampling_mask import get_rollout_sampling_masks
 from miles.backends.training_utils.loss.objective import loss_function
@@ -499,6 +500,8 @@ def run_forward_backward_pass(
                 "rollout_topk_token_ids",
                 "rollout_topk_lengths",
                 "rollout_topk_log_probs",
+                rollout_topk_prep.LOCAL_IDS,
+                rollout_topk_prep.LOCAL_LOG_PROBS,
                 "max_seq_lens",
                 "witness_ids",
                 "opd_reverse_kl",
@@ -513,6 +516,9 @@ def run_forward_backward_pass(
             args.qkv_format,
             allgather_cp=args.allgather_cp,
         )
+
+        # MILES_SC_TOPK_PREP: the last stage's top-k rows start moving to the device under the forward
+        rollout_topk_prep.prefetch(batch)
 
         if "adapter_token_counts" in batch:
             from megatron.bridge.peft.multi_lora_layers import set_tokens_per_adapter_slot
